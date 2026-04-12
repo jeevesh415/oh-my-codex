@@ -1,7 +1,7 @@
 import { spawnSync, execFile } from 'child_process';
 import { promisify } from 'util';
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import {
   CODEX_BYPASS_FLAG,
   MADMAX_FLAG,
@@ -9,15 +9,25 @@ import {
   LONG_CONFIG_FLAG,
   MODEL_FLAG,
 } from '../cli/constants.js';
+import { getAgent } from '../agents/definitions.js';
 import {
   buildCapturePaneArgv as sharedBuildCapturePaneArgv,
+  buildVisibleCapturePaneArgv as sharedBuildVisibleCapturePaneArgv,
   normalizeTmuxCapture as sharedNormalizeTmuxCapture,
   paneHasActiveTask as sharedPaneHasActiveTask,
   paneIsBootstrapping as sharedPaneIsBootstrapping,
+  paneShowsCodexViewport as sharedPaneShowsCodexViewport,
   paneLooksReady as sharedPaneLooksReady,
 } from '../scripts/tmux-hook-engine.js';
+import { readActiveProviderEnvOverrides } from '../config/models.js';
 import { sleep, sleepSync } from '../utils/sleep.js';
-import { classifySpawnError, resolveCommandPathForPlatform, spawnPlatformCommandSync } from '../utils/platform-command.js';
+import {
+  buildPlatformCommandSpec,
+  classifySpawnError,
+  resolveCommandPathForPlatform,
+  spawnPlatformCommandSync,
+} from '../utils/platform-command.js';
+import { resolveOmxCliEntryPath } from '../utils/paths.js';
 
 const execFileAsync = promisify(execFile);
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../hud/constants.js';
@@ -51,6 +61,17 @@ const GEMINI_APPROVAL_MODE_FLAG = '--approval-mode';
 const GEMINI_APPROVAL_MODE_YOLO = 'yolo';
 const OMX_LEADER_NODE_PATH_ENV = 'OMX_LEADER_NODE_PATH';
 const OMX_LEADER_CLI_PATH_ENV = 'OMX_LEADER_CLI_PATH';
+const TMUX_NO_UNDERLINE_STYLE_FLAGS = [
+  'nounderscore',
+  'nodouble-underscore',
+  'nocurly-underscore',
+  'nodotted-underscore',
+  'nodashed-underscore',
+] as const;
+const TMUX_COPY_MODE_STYLE_OPTIONS = [
+  'mode-style',
+  'copy-mode-selection-style',
+] as const;
 
 export type TeamWorkerCli = 'codex' | 'claude' | 'gemini';
 type TeamWorkerCliMode = 'auto' | TeamWorkerCli;
@@ -93,6 +114,57 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
   }
   return { ok: true, stdout: (result.stdout || '').trim() };
+}
+
+function appendNoUnderlineStyleFlags(style: string): string {
+  const normalized = style
+    .split(/[,\s]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+  const combined = [...normalized];
+  for (const flag of TMUX_NO_UNDERLINE_STYLE_FLAGS) {
+    if (!combined.includes(flag)) combined.push(flag);
+  }
+  return combined.join(',');
+}
+
+function sanitizeTmuxStyleOption(sessionTarget: string, optionName: string): boolean {
+  const shown = runTmux(['show-options', '-gv', '-t', sessionTarget, optionName]);
+  if (!shown.ok) return false;
+
+  const current = shown.stdout.trim();
+  if (current === '') return false;
+
+  const sanitized = appendNoUnderlineStyleFlags(current);
+  if (sanitized === current) return true;
+
+  const result = runTmux(['set-option', '-t', sessionTarget, optionName, sanitized]);
+  return result.ok;
+}
+
+export function mitigateCopyModeUnderlineArtifacts(sessionTarget: string): boolean {
+  const normalizedTarget = sessionTarget.trim();
+  if (normalizedTarget === '') return false;
+
+  let applied = false;
+  for (const optionName of TMUX_COPY_MODE_STYLE_OPTIONS) {
+    if (sanitizeTmuxStyleOption(normalizedTarget, optionName)) {
+      applied = true;
+    }
+  }
+  return applied;
+}
+
+export function hasCurrentTmuxClientContext(): boolean {
+  const tmuxPaneTarget = process.env.TMUX_PANE?.trim();
+  const displayArgs = tmuxPaneTarget
+    ? ['display-message', '-p', '-t', tmuxPaneTarget, '#S:#I #{pane_id}']
+    : ['display-message', '-p', '#S:#I #{pane_id}'];
+  const context = runTmux(displayArgs);
+  if (!context.ok) return false;
+  const [sessionAndWindow = '', detectedLeaderPaneId = ''] = context.stdout.split(' ');
+  const [sessionName, windowIndex] = sessionAndWindow.split(':');
+  return Boolean(sessionName && windowIndex && detectedLeaderPaneId.startsWith('%'));
 }
 
 export function isMsysOrGitBash(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
@@ -147,6 +219,10 @@ function listPanes(target: string): TmuxPaneInfo[] {
       return { paneId, currentCommand, startCommand };
     })
     .filter((pane) => pane.paneId.startsWith('%'));
+}
+
+export function listPaneIds(target: string): string[] {
+  return listPanes(target).map((pane) => pane.paneId);
 }
 
 function isHudWatchPane(pane: TmuxPaneInfo): boolean {
@@ -252,6 +328,14 @@ function shellQuoteSingle(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function quotePowerShellArg(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function encodePowerShellCommand(commandText: string): string {
+  return Buffer.from(commandText, 'utf16le').toString('base64');
+}
+
 function normalizeTmuxHookToken(value: string): string {
   const normalized = value.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
   return normalized === '' ? 'unknown' : normalized;
@@ -297,6 +381,26 @@ function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX
   return `resize-pane -t ${buildHudPaneTarget(hudPaneId)} -y ${resolveHudHeightLines(heightLines)}`;
 }
 
+function buildHudResizeArgs(
+  hudPaneId: string,
+  heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+): string[] {
+  return ['resize-pane', '-t', buildHudPaneTarget(hudPaneId), '-y', String(resolveHudHeightLines(heightLines))];
+}
+
+function buildNestedTmuxShellCommand(command: string): string {
+  if (process.platform !== 'win32') {
+    return `tmux ${command}`;
+  }
+
+  const resolvedTmuxPath = resolveAbsoluteBinaryPath('tmux');
+  if (resolvedTmuxPath === 'tmux') {
+    return `tmux ${command}`;
+  }
+
+  return `${shellQuoteSingle(resolvedTmuxPath.replace(/\\/g, '/'))} ${command}`;
+}
+
 function buildBestEffortShellCommand(command: string): string {
   return `${command} >/dev/null 2>&1 || true`;
 }
@@ -326,7 +430,9 @@ export function buildRegisterResizeHookArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
-  const resizeCommand = shellQuoteSingle(buildBestEffortShellCommand(`tmux ${buildHudResizeCommand(hudPaneId, heightLines)}`));
+  const resizeCommand = shellQuoteSingle(
+    buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines))),
+  );
   return ['set-hook', '-t', hookTarget, buildResizeHookSlot(hookName), `run-shell -b ${resizeCommand}`];
 }
 
@@ -357,7 +463,7 @@ export function buildRegisterClientAttachedReconcileArgs(
 ): string[] {
   const hookSlot = buildClientAttachedHookSlot(hookName);
   const oneShotCommand = shellQuoteSingle(
-    `${buildBestEffortShellCommand(`tmux ${buildHudResizeCommand(hudPaneId, heightLines)}`)}; tmux set-hook -u -t ${hookTarget} ${hookSlot}`,
+    `${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
   );
   return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}`];
 }
@@ -377,14 +483,14 @@ export function buildScheduleDelayedHudResizeArgs(
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
   const delay = Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : HUD_RESIZE_RECONCILE_DELAY_SECONDS;
-  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(`tmux ${buildHudResizeCommand(hudPaneId, heightLines)}`)}`];
+  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}`];
 }
 
 export function buildReconcileHudResizeArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
-  return ['run-shell', buildBestEffortShellCommand(`tmux ${buildHudResizeCommand(hudPaneId, heightLines)}`)];
+  return ['run-shell', buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))];
 }
 
 const ZSH_CANDIDATE_PATHS = ['/bin/zsh', '/usr/bin/zsh', '/usr/local/bin/zsh', '/opt/homebrew/bin/zsh'];
@@ -548,12 +654,27 @@ export function resolveTeamWorkerCliPlan(
   });
 }
 
-export function translateWorkerLaunchArgsForCli(workerCli: TeamWorkerCli, args: string[], initialPrompt?: string): string[] {
+function shouldGrantExecutionBypassForRole(workerRole?: string): boolean {
+  const normalizedRole = workerRole?.trim().toLowerCase();
+  if (!normalizedRole) return true;
+  const agent = getAgent(normalizedRole);
+  if (!agent) return true;
+  return agent.tools === 'execution';
+}
+
+export function translateWorkerLaunchArgsForCli(
+  workerCli: TeamWorkerCli,
+  args: string[],
+  initialPrompt?: string,
+  workerRole?: string,
+): string[] {
   if (workerCli === 'codex') return [...args];
   if (workerCli === 'gemini') {
     const model = extractModelOverride(args);
     const geminiModel = model && /gemini/i.test(model) ? model : null;
-    const translatedArgs = [GEMINI_APPROVAL_MODE_FLAG, GEMINI_APPROVAL_MODE_YOLO];
+    const translatedArgs = shouldGrantExecutionBypassForRole(workerRole)
+      ? [GEMINI_APPROVAL_MODE_FLAG, GEMINI_APPROVAL_MODE_YOLO]
+      : [];
     const trimmedPrompt = initialPrompt?.trim();
     if (trimmedPrompt) translatedArgs.push(GEMINI_PROMPT_INTERACTIVE_FLAG, trimmedPrompt);
     if (geminiModel) translatedArgs.push(MODEL_FLAG, geminiModel);
@@ -563,7 +684,7 @@ export function translateWorkerLaunchArgsForCli(workerCli: TeamWorkerCli, args: 
   // Claude workers must launch with exactly one permissions bypass flag.
   // All other launch args are dropped to avoid Codex-only flags and model/config overrides.
   void args;
-  return [CLAUDE_SKIP_PERMISSIONS_FLAG];
+  return shouldGrantExecutionBypassForRole(workerRole) ? [CLAUDE_SKIP_PERMISSIONS_FLAG] : [];
 }
 
 function commandExists(binary: string): boolean {
@@ -588,6 +709,10 @@ function resolveAbsoluteBinaryPath(binary: string): string {
  */
 let _leaderPaths: { node: string; } | null = null;
 function resolveLeaderNodePath(): string {
+  const envOverride = process.env[OMX_LEADER_NODE_PATH_ENV];
+  if (typeof envOverride === 'string' && envOverride.trim() !== '') {
+    return envOverride.trim();
+  }
   if (!_leaderPaths) {
     _leaderPaths = { node: resolveAbsoluteBinaryPath('node') };
   }
@@ -634,6 +759,7 @@ export function buildWorkerStartupCommand(
   extraEnv: Record<string, string> = {},
   workerCliOverride?: TeamWorkerCli,
   initialPrompt?: string,
+  workerRole?: string,
 ): string {
   const processSpec = buildWorkerProcessLaunchSpec(
     teamName,
@@ -643,9 +769,32 @@ export function buildWorkerStartupCommand(
     extraEnv,
     workerCliOverride,
     initialPrompt,
+    workerRole,
   );
+  const resolvedLeaderNodePath = processSpec.env[OMX_LEADER_NODE_PATH_ENV]?.trim() || resolveLeaderNodePath();
+  const leaderNodeDir = /[\\/]/.test(resolvedLeaderNodePath)
+    ? resolvedLeaderNodePath.replace(/[\\/][^\\/]+$/, '')
+    : '';
+  if (isNativeWindows()) {
+    const pathBootstrap = leaderNodeDir
+      ? `$env:PATH = ${quotePowerShellArg(`${leaderNodeDir};`)} + $env:PATH`
+      : '';
+    const envAssignments = Object.entries(processSpec.env)
+      .map(([key, value]) => `$env:${key} = ${quotePowerShellArg(value)}`)
+      .join('; ');
+    const invocation = ['&', quotePowerShellArg(processSpec.command), ...processSpec.args.map(quotePowerShellArg)].join(' ');
+    const encodedCommand = encodePowerShellCommand(
+      [
+        "$ErrorActionPreference = 'Stop'",
+        pathBootstrap,
+        envAssignments,
+        invocation,
+      ].filter(Boolean).join('; '),
+    );
+    return `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
+  }
+
   const launchSpec = buildWorkerLaunchSpec(process.env.SHELL);
-  const leaderNodeDir = resolveLeaderNodePath().replace(/\/[^/]+$/, ''); // dirname
   const pathPrefix = leaderNodeDir ? `export PATH='${leaderNodeDir}':$PATH; ` : '';
   const quotedArgs = processSpec.args.map(shellQuoteSingle).join(' ');
   const cliInvocation = quotedArgs.length > 0 ? `exec ${processSpec.command} ${quotedArgs}` : `exec ${processSpec.command}`;
@@ -653,7 +802,7 @@ export function buildWorkerStartupCommand(
   const inner = `${rcPrefix}${pathPrefix}${cliInvocation}`;
   const envParts = Object.entries(processSpec.env).map(([key, value]) => `${key}=${value}`);
 
-  return `env ${envParts.map(shellQuoteSingle).join(' ')} ${shellQuoteSingle(launchSpec.shell)} -lc ${shellQuoteSingle(inner)}`;
+  return `env ${envParts.map(shellQuoteSingle).join(' ')} ${shellQuoteSingle(launchSpec.shell)} -c ${shellQuoteSingle(inner)}`;
 }
 
 export function buildWorkerProcessLaunchSpec(
@@ -664,20 +813,39 @@ export function buildWorkerProcessLaunchSpec(
   extraEnv: Record<string, string> = {},
   workerCliOverride?: TeamWorkerCli,
   initialPrompt?: string,
+  workerRole?: string,
 ): WorkerProcessLaunchSpec {
   const effectiveEnv: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
   const fullLaunchArgs = resolveWorkerLaunchArgs(launchArgs, cwd, effectiveEnv);
   const workerCli = workerCliOverride ?? resolveTeamWorkerCli(fullLaunchArgs, effectiveEnv);
-  const cliLaunchArgs = translateWorkerLaunchArgsForCli(workerCli, fullLaunchArgs, initialPrompt);
-  const effectiveCliLaunchArgs = workerCli === 'codex' && !cliLaunchArgs.includes(CODEX_BYPASS_FLAG)
+  const cliLaunchArgs = translateWorkerLaunchArgsForCli(workerCli, fullLaunchArgs, initialPrompt, workerRole);
+  const effectiveCliLaunchArgs = workerCli === 'codex'
+    && shouldGrantExecutionBypassForRole(workerRole)
+    && !cliLaunchArgs.includes(CODEX_BYPASS_FLAG)
     ? [...cliLaunchArgs, CODEX_BYPASS_FLAG]
     : cliLaunchArgs;
+  const workerCodexHomeOverride = typeof effectiveEnv.CODEX_HOME === 'string'
+    ? effectiveEnv.CODEX_HOME.trim()
+    : undefined;
+  const providerLookupCodexHome = workerCodexHomeOverride
+    ? (isAbsolute(workerCodexHomeOverride) ? workerCodexHomeOverride : resolve(cwd, workerCodexHomeOverride))
+    : undefined;
 
   const resolvedCliPath = resolveAbsoluteBinaryPath(workerCli);
+  const platformSpec = isNativeWindows()
+    ? buildPlatformCommandSpec(workerCli, effectiveCliLaunchArgs, process.platform, effectiveEnv)
+    : { command: resolvedCliPath, args: effectiveCliLaunchArgs };
+  const resolvedLauncherPath = platformSpec.resolvedPath || resolvedCliPath;
   const workerEnv: Record<string, string> = {
     OMX_TEAM_WORKER: `${teamName}/worker-${workerIndex}`,
     [OMX_LEADER_NODE_PATH_ENV]: resolveLeaderNodePath(),
-    [OMX_LEADER_CLI_PATH_ENV]: resolvedCliPath,
+    [OMX_LEADER_CLI_PATH_ENV]: resolvedLauncherPath,
+    ...(workerCli === 'codex'
+      ? readActiveProviderEnvOverrides(
+          effectiveEnv,
+          providerLookupCodexHome,
+        )
+      : {}),
   };
   for (const [key, value] of Object.entries(extraEnv)) {
     if (typeof value !== 'string' || value.trim() === '') continue;
@@ -686,8 +854,8 @@ export function buildWorkerProcessLaunchSpec(
 
   return {
     workerCli,
-    command: resolvedCliPath,
-    args: effectiveCliLaunchArgs,
+    command: platformSpec.command,
+    args: platformSpec.args,
     env: workerEnv,
   };
 }
@@ -754,6 +922,7 @@ export function createTeamSession(
     initialPrompt?: string;
     launchArgs?: string[];
     workerCli?: TeamWorkerCli;
+    workerRole?: string;
   }> = [],
 ): TeamSession {
   if (!isTmuxAvailable()) {
@@ -762,7 +931,7 @@ export function createTeamSession(
   if (!Number.isInteger(workerCount) || workerCount < 1) {
     throw new Error(`workerCount must be >= 1 (got ${workerCount})`);
   }
-  if (!process.env.TMUX) {
+  if (!hasCurrentTmuxClientContext()) {
     throw new Error('team mode requires running inside tmux leader pane');
   }
   const normalizedWorkerLaunchArgs = resolveWorkerLaunchArgs(workerLaunchArgs, cwd);
@@ -819,6 +988,7 @@ export function createTeamSession(
         workerEnv,
         workerCliPlan[i - 1],
         startup.initialPrompt,
+        startup.workerRole,
       );
       // First split creates the right side from leader. Remaining splits stack on the right.
       const splitDirection = i === 1 ? '-h' : '-v';
@@ -869,7 +1039,7 @@ export function createTeamSession(
     let hudPaneId: string | null = null;
     let resizeHookName: string | null = null;
     let resizeHookTarget: string | null = null;
-    const omxEntry = process.argv[1];
+    const omxEntry = resolveOmxCliEntryPath();
     if (omxEntry && omxEntry.trim() !== '') {
       const hudCmd = `node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
       const hudCwd = translatePathForMsys(cwd);
@@ -882,37 +1052,46 @@ export function createTeamSession(
           hudPaneId = id;
           rollbackPaneIds.push(hudPaneId);
 
-          resizeHookTarget = buildResizeHookTarget(sessionName, windowIndex);
-          resizeHookName = buildResizeHookName(safeTeamName, sessionName, windowIndex, hudPaneId);
-          const registerHook = runTmux(buildRegisterResizeHookArgs(resizeHookTarget, resizeHookName, hudPaneId));
-          if (!registerHook.ok) {
-            throw new Error(`failed to register resize hook ${resizeHookName}: ${registerHook.stderr}`);
-          }
-          registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
+          if (isNativeWindows()) {
+            // Native Windows tmux support may flow through psmux; issuing a
+            // direct control-plane resize avoids nested run-shell PATH drift.
+            const reconcile = runTmux(buildHudResizeArgs(hudPaneId));
+            if (!reconcile.ok) {
+              throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
+            }
+          } else {
+            resizeHookTarget = buildResizeHookTarget(sessionName, windowIndex);
+            resizeHookName = buildResizeHookName(safeTeamName, sessionName, windowIndex, hudPaneId);
+            const registerHook = runTmux(buildRegisterResizeHookArgs(resizeHookTarget, resizeHookName, hudPaneId));
+            if (!registerHook.ok) {
+              throw new Error(`failed to register resize hook ${resizeHookName}: ${registerHook.stderr}`);
+            }
+            registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
 
-          const clientAttachedHookName = buildClientAttachedReconcileHookName(
-            safeTeamName,
-            sessionName,
-            windowIndex,
-            hudPaneId,
-          );
-          const registerClientAttachedHook = runTmux(
-            buildRegisterClientAttachedReconcileArgs(resizeHookTarget, clientAttachedHookName, hudPaneId),
-          );
-          if (!registerClientAttachedHook.ok) {
-            throw new Error(
-              `failed to register client-attached reconcile hook ${clientAttachedHookName}: ${registerClientAttachedHook.stderr}`,
+            const clientAttachedHookName = buildClientAttachedReconcileHookName(
+              safeTeamName,
+              sessionName,
+              windowIndex,
+              hudPaneId,
             );
-          }
-          registeredClientAttachedHook = { name: clientAttachedHookName, target: resizeHookTarget };
+            const registerClientAttachedHook = runTmux(
+              buildRegisterClientAttachedReconcileArgs(resizeHookTarget, clientAttachedHookName, hudPaneId),
+            );
+            if (!registerClientAttachedHook.ok) {
+              throw new Error(
+                `failed to register client-attached reconcile hook ${clientAttachedHookName}: ${registerClientAttachedHook.stderr}`,
+              );
+            }
+            registeredClientAttachedHook = { name: clientAttachedHookName, target: resizeHookTarget };
 
-          const delayed = runTmux(buildScheduleDelayedHudResizeArgs(hudPaneId));
-          if (!delayed.ok) {
-            throw new Error(`failed to schedule delayed HUD resize: ${delayed.stderr}`);
-          }
-          const reconcile = runTmux(buildReconcileHudResizeArgs(hudPaneId));
-          if (!reconcile.ok) {
-            throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
+            const delayed = runTmux(buildScheduleDelayedHudResizeArgs(hudPaneId));
+            if (!delayed.ok) {
+              throw new Error(`failed to schedule delayed HUD resize: ${delayed.stderr}`);
+            }
+            const reconcile = runTmux(buildReconcileHudResizeArgs(hudPaneId));
+            if (!reconcile.ok) {
+              throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
+            }
           }
         }
       }
@@ -965,10 +1144,10 @@ export function restoreStandaloneHudPane(
   const normalizedLeaderPaneId = normalizePaneTarget(leaderPaneId);
   if (!normalizedLeaderPaneId) return null;
 
-  const omxEntry = process.argv[1];
+  const omxEntry = resolveOmxCliEntryPath();
   if (!omxEntry || omxEntry.trim() === '') return null;
 
-  const hudCmd = `node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
+  const hudCmd = `${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
   const hudCwd = translatePathForMsys(cwd);
   const hudResult = runTmux([
     'split-window',
@@ -990,8 +1169,12 @@ export function restoreStandaloneHudPane(
   const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
   if (!paneId.startsWith('%')) return null;
 
-  runTmux(buildScheduleDelayedHudResizeArgs(paneId));
-  runTmux(buildReconcileHudResizeArgs(paneId));
+  if (isNativeWindows()) {
+    runTmux(buildHudResizeArgs(paneId));
+  } else {
+    runTmux(buildScheduleDelayedHudResizeArgs(paneId));
+    runTmux(buildReconcileHudResizeArgs(paneId));
+  }
   runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
   return paneId;
 }
@@ -1012,6 +1195,10 @@ export function enableMouseScrolling(sessionTarget: string): boolean {
   // Enable OSC 52 so copy-selection-and-cancel propagates selected text to
   // the terminal's clipboard without requiring xclip or pbcopy. (closes #206)
   runTmux(['set-option', '-t', sessionTarget, 'set-clipboard', 'on']);
+
+  // Mouse selection enters tmux copy-mode. Keep the mitigation session-scoped
+  // so OMX does not mutate users' global tmux style defaults. (issue #1448)
+  mitigateCopyModeUnderlineArtifacts(sessionTarget);
 
   return true;
 }
@@ -1036,6 +1223,32 @@ function paneHasTrustPrompt(captured: string): boolean {
   const hasQuestion = tail.some((line) => /Do you trust the contents of this directory\?/i.test(line));
   const hasActiveChoices = tail.some((line) => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(line));
   return hasQuestion && hasActiveChoices;
+}
+
+function paneHasClaudeBypassPermissionsPrompt(captured: string): boolean {
+  const lines = captured
+    .split('\n')
+    .map((line) => line.replace(/\r/g, '').trim())
+    .filter((line) => line.length > 0);
+  const tail = lines.slice(-20);
+  const hasWarning = tail.some((line) => /Bypass Permissions mode/i.test(line));
+  const hasChoices = tail.some((line) => /No,\s*exit/i.test(line))
+    && tail.some((line) => /Yes,\s*I\s*accept/i.test(line))
+    && tail.some((line) => /Enter\s*to\s*confirm/i.test(line));
+  return hasWarning && hasChoices;
+}
+
+function acceptClaudeBypassPermissionsPrompt(target: string): void {
+  runTmux(['send-keys', '-t', target, '-l', '--', '2']);
+  sleepFractionalSeconds(0.12);
+  runTmux(['send-keys', '-t', target, 'C-m']);
+}
+
+function dismissClaudeBypassPermissionsPromptIfPresent(target: string, captured: string): boolean {
+  if (process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS === '0') return false;
+  if (!paneHasClaudeBypassPermissionsPrompt(captured)) return false;
+  acceptClaudeBypassPermissionsPrompt(target);
+  return true;
 }
 
 export const paneHasActiveTask = sharedPaneHasActiveTask;
@@ -1175,7 +1388,7 @@ export function waitForWorkerReady(
   const maxBackoffMs = 8000;
   const startedAt = Date.now();
   let blockedByTrustPrompt = false;
-  let trustPromptDismissed = false;
+  let promptDismissed = false;
 
   const sendRobustEnter = (): void => {
     const target = paneTarget(sessionName, workerIndex, workerPaneId);
@@ -1187,20 +1400,36 @@ export function waitForWorkerReady(
   };
 
   const check = (): boolean => {
-    const result = runTmux(['capture-pane', '-t', paneTarget(sessionName, workerIndex, workerPaneId), '-p']);
+    const target = paneTarget(sessionName, workerIndex, workerPaneId);
+    const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
     if (!result.ok) return false;
+    if (dismissClaudeBypassPermissionsPromptIfPresent(target, result.stdout)) {
+      promptDismissed = true;
+      return false;
+    }
+    if (paneHasClaudeBypassPermissionsPrompt(result.stdout)) {
+      return false;
+    }
     if (paneHasTrustPrompt(result.stdout)) {
       // Default-on for team workers: they are spawned explicitly by the leader in the same cwd.
       // Opt-out by setting OMX_TEAM_AUTO_TRUST=0.
       if (process.env.OMX_TEAM_AUTO_TRUST !== '0') {
         sendRobustEnter();
-        trustPromptDismissed = true;
+        promptDismissed = true;
         return false;
       }
       blockedByTrustPrompt = true;
       return false;
     }
-    return paneLooksReady(result.stdout);
+    if (paneLooksReady(result.stdout)) return true;
+    // Keep startup safety checks anchored to the visible pane. Only if the
+    // visible slice already proves a live Codex viewport do we consult recent
+    // scrollback for the prompt/helper text that may have slipped below the fold.
+    if (!sharedPaneShowsCodexViewport(result.stdout)) return false;
+
+    const scrollbackResult = runTmux(sharedBuildCapturePaneArgv(target, 80));
+    if (!scrollbackResult.ok) return false;
+    return paneLooksReady(scrollbackResult.stdout);
   };
 
   let delayMs = initialBackoffMs;
@@ -1209,9 +1438,9 @@ export function waitForWorkerReady(
     if (blockedByTrustPrompt) return false;
     // After dismissing a trust prompt, reset backoff so we re-check quickly
     // instead of sleeping 2s/4s/8s while the worker is starting up.
-    if (trustPromptDismissed) {
+    if (promptDismissed) {
       delayMs = initialBackoffMs;
-      trustPromptDismissed = false;
+      promptDismissed = false;
     }
     const remaining = timeoutMs - (Date.now() - startedAt);
     if (remaining <= 0) break;
@@ -1235,7 +1464,7 @@ export function dismissTrustPromptIfPresent(
   if (process.env.OMX_TEAM_AUTO_TRUST === '0') return false;
   if (!isTmuxAvailable()) return false;
   const target = paneTarget(sessionName, workerIndex, workerPaneId);
-  const result = runTmux(['capture-pane', '-t', target, '-p']);
+  const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
   if (!result.ok) return false;
   if (!paneHasTrustPrompt(result.stdout)) return false;
   // Trust prompt detected; send C-m twice to dismiss (trust + follow-up splash)
@@ -1290,6 +1519,9 @@ export async function sendToWorker(
   // doesn't get typed into the trust screen and ignored.
   const capturedStr = await capturePaneAsync(target);
   const paneBusy = paneHasActiveTask(capturedStr);
+  if (dismissClaudeBypassPermissionsPromptIfPresent(target, capturedStr)) {
+    await sleep(200);
+  }
   if (paneHasTrustPrompt(capturedStr)) {
     await sendKeyAsync(target, 'C-m');
     await sleep(120);
@@ -1411,6 +1643,19 @@ export function isWorkerAlive(sessionName: string, workerIndex: number, workerPa
   }
 }
 
+export function isWorkerPaneOpen(sessionName: string, workerIndex: number, workerPaneId?: string): boolean {
+  const result = runTmux([
+    'list-panes',
+    '-t', paneTarget(sessionName, workerIndex, workerPaneId),
+    '-F',
+    '#{pane_dead}',
+  ]);
+  if (!result.ok) return false;
+  const line = result.stdout.split('\n')[0]?.trim();
+  if (!line) return false;
+  return line !== '1';
+}
+
 // Kill a specific worker: send C-c, then C-d, then kill-pane if still alive.
 // leaderPaneId: when provided, the kill is skipped entirely if workerPaneId matches it.
 export async function killWorker(sessionName: string, workerIndex: number, workerPaneId?: string, leaderPaneId?: string): Promise<void> {
@@ -1465,6 +1710,12 @@ export interface PaneTeardownOptions {
   graceMs?: number;
 }
 
+export interface SharedSessionShutdownTopology {
+  livePaneIds: string[];
+  leaderPaneId: string | null;
+  hudPaneIds: string[];
+}
+
 function normalizePaneTarget(value: string | null | undefined): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -1502,6 +1753,39 @@ function normalizePaneTargets(
   }
 
   return { killablePaneIds, excluded };
+}
+
+export function resolveSharedSessionShutdownTopology(
+  sessionName: string,
+  preferredLeaderPaneId?: string | null,
+): SharedSessionShutdownTopology {
+  const panes = listPanes(sessionName);
+  const livePaneIds = panes
+    .map((pane) => normalizePaneTarget(pane.paneId))
+    .filter((paneId): paneId is string => Boolean(paneId));
+  const fallbackLeaderPaneId = normalizePaneTarget(preferredLeaderPaneId);
+  if (panes.length === 0) {
+    return {
+      livePaneIds,
+      leaderPaneId: fallbackLeaderPaneId,
+      hudPaneIds: [],
+    };
+  }
+
+  const resolvedLeaderPaneId = normalizePaneTarget(
+    chooseTeamLeaderPaneId(panes, fallbackLeaderPaneId ?? ''),
+  ) ?? fallbackLeaderPaneId;
+  const hudPaneIds = panes
+    .filter((pane) => pane.paneId !== resolvedLeaderPaneId)
+    .filter((pane) => isHudWatchPane(pane))
+    .map((pane) => pane.paneId)
+    .filter((paneId) => paneId.startsWith('%'));
+
+  return {
+    livePaneIds,
+    leaderPaneId: resolvedLeaderPaneId,
+    hudPaneIds,
+  };
 }
 
 /**
@@ -1569,29 +1853,13 @@ export function listTeamSessions(): string[] {
 }
 
 /**
- * Send a trigger message directly to the leader pane via tmux send-keys.
- * Used as the direct-inject fallback when hook-based dispatch to the leader
- * times out. Unlike notifyLeaderMailboxAsync (which only writes to the
- * mailbox file), this actually injects text into the leader's tmux pane
- * so the leader sees it immediately. Fixes #437.
- */
-export async function sendToLeaderPane(
-  leaderPaneId: string,
-  text: string,
-): Promise<void> {
-  const send = runTmux(['send-keys', '-t', leaderPaneId, '-l', '--', text]);
-  if (!send.ok) {
-    throw new Error(`sendToLeaderPane: failed to send text: ${send.stderr}`);
-  }
-  await sleep(150);
-  await sendKeyAsync(leaderPaneId, 'C-m');
-  await sleep(100);
-  await sendKeyAsync(leaderPaneId, 'C-m');
-}
-
-/**
- * Notify the leader via mailbox instead of tmux display-message.
- * This is the async mailbox-based replacement for notifyLeaderStatus.
+ * Notify the leader through durable mailbox state only.
+ *
+ * Team leaders are a coordination endpoint, not a direct tmux control target:
+ * workers and runtime paths may message `leader-fixed` via `omx team api`
+ * / mailbox persistence, but team code must not inject text or control keys
+ * into the leader pane. This is the async mailbox-based replacement for
+ * `notifyLeaderStatus()`.
  */
 export async function notifyLeaderMailboxAsync(
   teamName: string,

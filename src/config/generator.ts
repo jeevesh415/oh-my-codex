@@ -7,17 +7,19 @@
  * [table] header.  This generator therefore splits its output into:
  *   1. Top-level keys  (notify, model_reasoning_effort, developer_instructions)
  *   2. [features] flags
- *   3. [table] sections (mcp_servers, tui)
+ *   3. [table] sections (env, mcp_servers, tui)
  */
 
 import { readFile, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
+import TOML from "@iarna/toml";
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { DEFAULT_FRONTIER_MODEL } from "./models.js";
 import type { UnifiedMcpRegistryServer } from "./mcp-registry.js";
 
 interface MergeOptions {
+  includeTui?: boolean;
   modelOverride?: string;
   sharedMcpServers?: UnifiedMcpRegistryServer[];
   sharedMcpRegistrySource?: string;
@@ -47,8 +49,17 @@ const SHARED_MCP_REGISTRY_END_MARKER =
   "# End oh-my-codex shared MCP registry sync";
 const OMX_AGENTS_MAX_THREADS = 6;
 const OMX_AGENTS_MAX_DEPTH = 2;
+const OMX_EXPLORE_ROUTING_DEFAULT = '1';
+const OMX_EXPLORE_CMD_ENV = 'USE_OMX_EXPLORE_CMD';
+const DEFAULT_LAUNCHER_MCP_STARTUP_TIMEOUT_SEC = 15;
 const OMX_TUI_STATUS_LINE =
-  'status_line = ["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit"]';
+  'status_line = ["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"]';
+const LEGACY_OMX_TEAM_RUN_TABLE_PATTERN =
+  /^\s*\[mcp_servers\.(?:"omx_team_run"|omx_team_run)\]\s*$/m;
+
+export function hasLegacyOmxTeamRunTable(config: string): boolean {
+  return LEGACY_OMX_TEAM_RUN_TABLE_PATTERN.test(config);
+}
 
 function unwrapTomlString(value: string | undefined): string | undefined {
   return value?.match(/^"(.*)"$/)?.[1];
@@ -83,7 +94,7 @@ function getOmxTopLevelLines(
     "# oh-my-codex top-level settings (must be before any [table])",
     `notify = ["node", "${escapedPath}"]`,
     'model_reasoning_effort = "high"',
-    `developer_instructions = "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use /prompts:<role> and spawned role prompts for specialized subagent work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat role prompts as narrower execution surfaces under AGENTS.md authority."`,
+    `developer_instructions = "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use skill/keyword routing like $name plus spawned role-specialized subagents for specialized work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat installed prompts as narrower internal execution surfaces under AGENTS.md authority, even when user-facing docs prefer $name keywords."`,
   ];
 
   const existingModel = rootValues.get("model");
@@ -178,6 +189,7 @@ function upsertFeatureFlags(config: string): string {
       "[features]",
       "multi_agent = true",
       "child_agents_md = true",
+      "codex_hooks = true",
       "",
     ].join("\n");
     if (base.length === 0) {
@@ -204,11 +216,14 @@ function upsertFeatureFlags(config: string): string {
 
   let multiAgentIdx = -1;
   let childAgentsIdx = -1;
+  let codexHooksIdx = -1;
   for (let i = featuresStart + 1; i < sectionEnd; i++) {
     if (/^\s*multi_agent\s*=/.test(lines[i])) {
       multiAgentIdx = i;
     } else if (/^\s*child_agents_md\s*=/.test(lines[i])) {
       childAgentsIdx = i;
+    } else if (/^\s*codex_hooks\s*=/.test(lines[i])) {
+      codexHooksIdx = i;
     }
   }
 
@@ -223,6 +238,55 @@ function upsertFeatureFlags(config: string): string {
     lines[childAgentsIdx] = "child_agents_md = true";
   } else {
     lines.splice(sectionEnd, 0, "child_agents_md = true");
+    sectionEnd += 1;
+  }
+
+  if (codexHooksIdx >= 0) {
+    lines[codexHooksIdx] = "codex_hooks = true";
+  } else {
+    lines.splice(sectionEnd, 0, "codex_hooks = true");
+  }
+
+  return lines.join("\n");
+}
+
+function upsertEnvSettings(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const envStart = lines.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+
+  if (envStart < 0) {
+    const base = config.trimEnd();
+    const envBlock = [
+      "[env]",
+      `${OMX_EXPLORE_CMD_ENV} = "${OMX_EXPLORE_ROUTING_DEFAULT}"`,
+      "",
+    ].join("\n");
+    if (base.length === 0) return envBlock;
+    return `${base}\n\n${envBlock}`;
+  }
+
+  let sectionEnd = lines.length;
+  for (let i = envStart + 1; i < lines.length; i++) {
+    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  let exploreRoutingIdx = -1;
+  for (let i = envStart + 1; i < sectionEnd; i++) {
+    if (new RegExp(`^\\s*${OMX_EXPLORE_CMD_ENV}\\s*=`).test(lines[i])) {
+      exploreRoutingIdx = i;
+      break;
+    }
+  }
+
+  if (exploreRoutingIdx < 0) {
+    lines.splice(
+      sectionEnd,
+      0,
+      `${OMX_EXPLORE_CMD_ENV} = "${OMX_EXPLORE_ROUTING_DEFAULT}"`,
+    );
   }
 
   return lines.join("\n");
@@ -295,7 +359,7 @@ export function stripOmxFeatureFlags(config: string): string {
     }
   }
 
-  const omxFlags = ["multi_agent", "child_agents_md", "collab"];
+  const omxFlags = ["multi_agent", "child_agents_md", "codex_hooks", "collab"];
   const filtered: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (i > featuresStart && i < sectionEnd) {
@@ -322,6 +386,49 @@ export function stripOmxFeatureFlags(config: string): string {
     const sectionContent = filtered.slice(newFeaturesStart + 1, newSectionEnd);
     if (sectionContent.every((l) => l.trim() === "")) {
       filtered.splice(newFeaturesStart, newSectionEnd - newFeaturesStart);
+    }
+  }
+
+  return filtered.join("\n");
+}
+
+export function stripOmxEnvSettings(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const envStart = lines.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+
+  if (envStart < 0) return config;
+
+  let sectionEnd = lines.length;
+  for (let i = envStart + 1; i < lines.length; i++) {
+    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  const filtered: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i > envStart && i < sectionEnd) {
+      const isOmxEnvKey = new RegExp(
+        `^\\s*${OMX_EXPLORE_CMD_ENV}\\s*=`,
+      ).test(lines[i]);
+      if (isOmxEnvKey) continue;
+    }
+    filtered.push(lines[i]);
+  }
+
+  const newEnvStart = filtered.findIndex((line) => /^\s*\[env\]\s*$/.test(line));
+  if (newEnvStart >= 0) {
+    let newSectionEnd = filtered.length;
+    for (let i = newEnvStart + 1; i < filtered.length; i++) {
+      if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(filtered[i])) {
+        newSectionEnd = i;
+        break;
+      }
+    }
+    const envContent = filtered.slice(newEnvStart + 1, newSectionEnd);
+    if (envContent.every((line) => line.trim() === "")) {
+      filtered.splice(newEnvStart, newSectionEnd - newEnvStart);
     }
   }
 
@@ -571,6 +678,110 @@ function configHasMcpServer(config: string, name: string): boolean {
   return new RegExp(`^\\s*\\[${tableName}\\]\\s*$`, "m").test(config);
 }
 
+function launcherCommandBasename(command: string): string {
+  return command.replace(/\\/g, "/").trim().split("/").pop()?.toLowerCase() ?? "";
+}
+
+function isLauncherBackedMcpCommand(
+  command: string,
+  args: readonly string[],
+): boolean {
+  const base = launcherCommandBasename(command);
+  if (base === "npx" || base === "uvx") {
+    return true;
+  }
+
+  return base === "npm" && args[0]?.toLowerCase() === "exec";
+}
+
+interface LauncherTimeoutRepairTarget {
+  insertAt: number;
+}
+
+function findLauncherTimeoutRepairTargets(
+  config: string,
+): LauncherTimeoutRepairTarget[] {
+  const lines = config.split(/\r?\n/);
+  const targets: LauncherTimeoutRepairTarget[] = [];
+
+  for (let start = 0; start < lines.length; start += 1) {
+    const isMcpSection = /^\s*\[mcp_servers\./.test(lines[start] ?? "");
+    if (!isMcpSection) continue;
+
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i += 1) {
+      if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i] ?? "")) {
+        end = i;
+        break;
+      }
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = TOML.parse(lines.slice(start, end).join("\n"));
+    } catch {
+      start = end - 1;
+      continue;
+    }
+
+    const mcpServers = (parsed as { mcp_servers?: Record<string, unknown> })
+      .mcp_servers;
+    const [name, value] = Object.entries(mcpServers ?? {})[0] ?? [];
+    if (!name || name.startsWith("omx_") || typeof value !== "object" || !value) {
+      start = end - 1;
+      continue;
+    }
+
+    const section = value as Record<string, unknown>;
+    const command =
+      typeof section.command === "string" ? section.command : undefined;
+    const args =
+      Array.isArray(section.args) &&
+      section.args.every((item) => typeof item === "string")
+        ? (section.args as string[])
+        : [];
+    const hasStartupTimeout =
+      (
+        typeof section.startup_timeout_sec === "number" &&
+        Number.isFinite(section.startup_timeout_sec)
+      ) || (
+        typeof section.startupTimeoutSec === "number" &&
+        Number.isFinite(section.startupTimeoutSec)
+      );
+
+    if (!command || hasStartupTimeout || !isLauncherBackedMcpCommand(command, args)) {
+      start = end - 1;
+      continue;
+    }
+
+    let insertAt = end;
+    while (insertAt > start + 1 && (lines[insertAt - 1] ?? "").trim() === "") {
+      insertAt -= 1;
+    }
+
+    targets.push({ insertAt });
+    start = end - 1;
+  }
+
+  return targets;
+}
+
+function addDefaultLauncherMcpStartupTimeouts(config: string): string {
+  const targets = findLauncherTimeoutRepairTargets(config);
+  if (targets.length === 0) return config;
+
+  const lines = config.split(/\r?\n/);
+  for (const target of [...targets].reverse()) {
+    lines.splice(
+      target.insertAt,
+      0,
+      `startup_timeout_sec = ${DEFAULT_LAUNCHER_MCP_STARTUP_TIMEOUT_SEC}`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function getSharedMcpRegistryBlock(
   servers: UnifiedMcpRegistryServer[],
   sourcePath: string | undefined,
@@ -633,9 +844,6 @@ function getOmxTablesBlock(pkgRoot: string, includeTui = true): string {
   const traceServerPath = escapeTomlString(
     join(pkgRoot, "dist", "mcp", "trace-server.js"),
   );
-  const teamServerPath = escapeTomlString(
-    join(pkgRoot, "dist", "mcp", "team-server.js"),
-  );
 
   return [
     "",
@@ -671,13 +879,6 @@ function getOmxTablesBlock(pkgRoot: string, includeTui = true): string {
     `args = ["${traceServerPath}"]`,
     "enabled = true",
     "startup_timeout_sec = 5",
-    "",
-    "# OMX Team MCP Server (team job lifecycle: start, status, wait, cleanup)",
-    "[mcp_servers.omx_team_run]",
-    'command = "node"',
-    `args = ["${teamServerPath}"]`,
-    "enabled = true",
-    "startup_timeout_sec = 5",
     ...(includeTui
       ? [
           "",
@@ -704,8 +905,9 @@ function getOmxTablesBlock(pkgRoot: string, includeTui = true): string {
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
  *   2. [features] with multi_agent + child_agents_md
- *   3. … user sections …
- *   4. OMX [table] sections (mcp_servers, tui)
+ *   3. [env] with defaulted explore-routing opt-in
+ *   4. … user sections …
+ *   5. OMX [table] sections (mcp_servers, tui)
  */
 export function buildMergedConfig(
   existingConfig: string,
@@ -713,6 +915,7 @@ export function buildMergedConfig(
   options: MergeOptions = {},
 ): string {
   let existing = existingConfig;
+  const includeTui = options.includeTui !== false;
 
   if (existing.includes("oh-my-codex (OMX) Configuration")) {
     const stripped = stripExistingOmxBlocks(existing);
@@ -730,8 +933,11 @@ export function buildMergedConfig(
   }
   existing = stripOrphanedOmxSections(existing);
   existing = upsertFeatureFlags(existing);
+  existing = upsertEnvSettings(existing);
   existing = upsertAgentsSettings(existing);
-  const tuiUpsert = upsertTuiStatusLine(existing);
+  const tuiUpsert = includeTui
+    ? upsertTuiStatusLine(existing)
+    : { cleaned: existing, hadExistingTui: false };
   existing = tuiUpsert.cleaned;
 
   const topLines = getOmxTopLevelLines(
@@ -739,7 +945,10 @@ export function buildMergedConfig(
     existing,
     options.modelOverride,
   );
-  const tablesBlock = getOmxTablesBlock(pkgRoot, !tuiUpsert.hadExistingTui);
+  const tablesBlock = getOmxTablesBlock(
+    pkgRoot,
+    includeTui && !tuiUpsert.hadExistingTui,
+  );
   const sharedRegistryBlock = getSharedMcpRegistryBlock(
     options.sharedMcpServers ?? [],
     options.sharedMcpRegistrySource,
@@ -751,15 +960,19 @@ export function buildMergedConfig(
     body = body ? `${body}\n\n${sharedRegistryBlock}` : sharedRegistryBlock;
   }
 
-  return topLines.join("\n") + "\n\n" + body + "\n" + tablesBlock;
+  return addDefaultLauncherMcpStartupTimeouts(
+    topLines.join("\n") + "\n\n" + body + "\n" + tablesBlock,
+  );
 }
 
 /**
- * Detect and repair duplicate TOML table headers (e.g. [tui]) in config.toml.
+ * Detect and repair upgrade-era managed config incompatibilities in config.toml.
  *
  * After an omx version upgrade the OLD setup code (still loaded in memory)
- * may write a config with duplicate [tui] sections.  The Codex CLI TOML
- * parser rejects duplicates, so we must fix them before the CLI is spawned.
+ * may leave a config with duplicate [tui] sections or the retired
+ * [mcp_servers.omx_team_run] table. Codex rejects duplicate tables and newer
+ * OMX builds no longer ship the team MCP entrypoint, so we repair both before
+ * the CLI is spawned.
  *
  * Returns `true` if a repair was performed.
  */
@@ -772,10 +985,13 @@ export async function repairConfigIfNeeded(
 
   const content = await readFile(configPath, "utf-8");
   const tuiCount = (content.match(/^\s*\[tui\]\s*$/gm) || []).length;
-  if (tuiCount <= 1) return false;
+  const hasLegacyTeamRunTable = hasLegacyOmxTeamRunTable(content);
+  const hasLauncherTimeoutGap = findLauncherTimeoutRepairTargets(content).length > 0;
+  if (tuiCount <= 1 && !hasLegacyTeamRunTable && !hasLauncherTimeoutGap) return false;
 
-  // Duplicate [tui] detected — run full merge to repair
+  // Managed config compatibility issue detected — run full merge to repair
   const repaired = buildMergedConfig(content, pkgRoot, options);
+  if (repaired === content) return false;
   await writeFile(configPath, repaired);
   return true;
 }

@@ -31,6 +31,7 @@ $ralplan --interactive "task description"
 - Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
 - Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
 - If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the consensus-planning flow is grounded.
+- Right-size implementation steps and PRD story counts to the actual scope; do not default to exactly five steps when the task is clearly smaller or larger.
 - Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
 
 This skill invokes the Plan skill in consensus mode:
@@ -57,7 +58,7 @@ The consensus workflow:
    d. Return to Critic evaluation
    e. Repeat this loop until Critic returns `APPROVE` or 5 iterations are reached
    f. If 5 iterations are reached without `APPROVE`, present the best version to the user
-6. On Critic approval *(--interactive only)*: If `--interactive` is set, use `AskUserQuestion` to present the plan with approval options (Approve and execute via ralph / Approve and implement via team / Request changes / Reject). Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups), an explicit available-agent-types roster, concrete follow-up staffing guidance for both `ralph` and `team`, suggested reasoning levels by lane, explicit `omx team` / `$team` launch hints, and a concrete **team -> ralph** verification path. Otherwise, output the final plan and stop.
+6. On Critic approval *(--interactive only)*: If `--interactive` is set, use `AskUserQuestion` to present the plan with approval options (Approve and execute via ralph / Approve and implement via team / Request changes / Reject). Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups), an explicit available-agent-types roster, concrete follow-up staffing guidance for both `ralph` and `team`, suggested reasoning levels by lane, explicit `omx team` / `$team` launch hints, and a concrete **team verification** path. Otherwise, output the final plan and stop.
 7. *(--interactive only)* User chooses: Approve (ralph or team), Request changes, or Reject
 8. *(--interactive only)* On approval: invoke `$ralph` for sequential execution or `$team` for parallel team execution with the explicit available-agent-types roster, reasoning-by-lane guidance, role/staffing allocation guidance, launch hints, and verification-path guidance from the approved plan -- never implement directly
 

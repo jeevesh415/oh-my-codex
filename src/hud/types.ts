@@ -5,8 +5,8 @@
 /** Ralph loop state for HUD display */
 export interface RalphStateForHud {
   active: boolean;
-  iteration: number;
-  max_iterations: number;
+  iteration?: number;
+  max_iterations?: number;
 }
 
 /** Ultrawork state for HUD display */
@@ -17,6 +17,33 @@ export interface UltraworkStateForHud {
 
 /** Autopilot state for HUD display */
 export interface AutopilotStateForHud {
+  active: boolean;
+  current_phase?: string;
+}
+
+/** Ralplan state for HUD display */
+export interface RalplanStateForHud {
+  active: boolean;
+  current_phase?: string;
+  iteration?: number;
+  planning_complete?: boolean;
+}
+
+/** Deep-interview state for HUD display */
+export interface DeepInterviewStateForHud {
+  active: boolean;
+  current_phase?: string;
+  input_lock_active?: boolean;
+}
+
+/** Autoresearch state for HUD display */
+export interface AutoresearchStateForHud {
+  active: boolean;
+  current_phase?: string;
+}
+
+/** Ultraqa state for HUD display */
+export interface UltraqaStateForHud {
   active: boolean;
   current_phase?: string;
 }
@@ -61,6 +88,10 @@ export interface HudRenderContext {
   ralph: RalphStateForHud | null;
   ultrawork: UltraworkStateForHud | null;
   autopilot: AutopilotStateForHud | null;
+  ralplan: RalplanStateForHud | null;
+  deepInterview: DeepInterviewStateForHud | null;
+  autoresearch: AutoresearchStateForHud | null;
+  ultraqa: UltraqaStateForHud | null;
   team: TeamStateForHud | null;
   metrics: HudMetrics | null;
   hudNotify: HudNotifyState | null;

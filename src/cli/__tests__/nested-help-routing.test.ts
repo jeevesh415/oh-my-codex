@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 function runOmx(cwd: string, argv: string[]) {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
-  const omxBin = join(repoRoot, 'bin', 'omx.js');
+  const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
   return spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: 'utf-8',
@@ -28,6 +28,7 @@ describe('nested help routing', () => {
     [['autoresearch', '--help'], /Usage:[\s\S]*omx autoresearch <mission-dir>/i],
     [['hud', '--help'], /Usage:\s*\n\s*omx hud\s+Show current HUD state/i],
     [['hooks', '--help'], /Usage:\s*\n\s*omx hooks init/i],
+    [['state', '--help'], /Usage:\s*omx state <read\|write\|clear\|list-active\|get-status>/i],
     [['tmux-hook', '--help'], /Usage:\s*\n\s*omx tmux-hook init/i],
     [['ralph', '--help'], /omx ralph - Launch Codex with ralph persistence mode active/i],
   ] satisfies Array<[string[], RegExp]>) {
@@ -43,4 +44,16 @@ describe('nested help routing', () => {
       }
     });
   }
+
+  it('routes `omx state read` through the top-level CLI', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-state-route-'));
+    try {
+      const result = runOmx(cwd, ['state', 'read', '--input', '{"mode":"ralph"}', '--json']);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stdout.trim(), /^\{"exists":false,"mode":"ralph"\}$/);
+      assert.doesNotMatch(result.stdout, /Unknown command: state/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

@@ -31,6 +31,16 @@ import {
 } from "./state-paths.js";
 import { withModeRuntimeContext } from "../state/mode-state-context.js";
 import {
+	SKILL_ACTIVE_STATE_MODE,
+	readSkillActiveState,
+	syncCanonicalSkillStateForMode,
+	writeSkillActiveStateCopies,
+} from "../state/skill-active.js";
+import {
+	isTrackedWorkflowMode,
+} from "../state/workflow-transition.js";
+import { reconcileWorkflowTransition } from "../state/workflow-transition-reconcile.js";
+import {
 	RALPH_PHASES,
 	validateAndNormalizeRalphState,
 } from "../ralph/contract.js";
@@ -48,6 +58,8 @@ const SUPPORTED_MODES = [
 	"ultrawork",
 	"ultraqa",
 	"ralplan",
+	"deep-interview",
+	"skill-active",
 ] as const;
 
 const STATE_TOOL_NAMES = new Set([
@@ -60,6 +72,16 @@ const STATE_TOOL_NAMES = new Set([
 const TEAM_COMM_TOOL_NAMES: Set<string> = new Set([...LEGACY_TEAM_MCP_TOOLS]);
 
 const stateWriteQueues = new Map<string, Promise<void>>();
+
+async function listStateSessionIds(cwd: string): Promise<string[]> {
+	const sessionsDir = join(getStateDir(cwd), "sessions");
+	if (!existsSync(sessionsDir)) return [];
+	const entries = await readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+	return entries
+		.filter((entry) => entry.isDirectory())
+		.map((entry) => entry.name)
+		.filter((entry) => entry.trim().length > 0);
+}
 
 async function withStateWriteLock<T>(
 	path: string,
@@ -328,6 +350,7 @@ export async function handleStateToolCall(request: {
 					...fields
 				} = args as Record<string, unknown>;
 				let validationError: string | null = null;
+				let transitionMessage: string | undefined;
 				await withStateWriteLock(path, async () => {
 					let existing: Record<string, unknown> = {};
 					if (existsSync(path)) {
@@ -345,6 +368,36 @@ export async function handleStateToolCall(request: {
 						...fields,
 						...((customState as Record<string, unknown>) || {}),
 					} as Record<string, unknown>;
+					if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
+						try {
+							if (!effectiveSessionId) {
+								for (const sessionId of await listStateSessionIds(cwd)) {
+									const sessionTransition = await reconcileWorkflowTransition(cwd, mode, {
+										action: "write",
+										sessionId,
+										source: "state-server",
+									});
+									transitionMessage ??= sessionTransition.transitionMessage;
+								}
+							}
+							const transition = await reconcileWorkflowTransition(cwd, mode, {
+								action: "write",
+								sessionId: effectiveSessionId,
+								source: "state-server",
+							});
+							transitionMessage ??= transition.transitionMessage;
+						} catch (error) {
+							validationError = (error as Error).message;
+							return;
+						}
+					}
+					if (
+						mode === "ralph" &&
+						effectiveSessionId &&
+						typeof mergedRaw.owner_omx_session_id !== "string"
+					) {
+						mergedRaw.owner_omx_session_id = effectiveSessionId;
+					}
 
 					if (mode === "ralph") {
 						const originalPhase = mergedRaw.current_phase;
@@ -380,11 +433,31 @@ export async function handleStateToolCall(request: {
 						isError: true,
 					};
 				}
+				if (mode === SKILL_ACTIVE_STATE_MODE) {
+					const state = await readSkillActiveState(path);
+					if (state) {
+						await writeSkillActiveStateCopies(cwd, state, effectiveSessionId);
+					}
+				} else {
+					const data = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+					await syncCanonicalSkillStateForMode({
+						cwd,
+						mode,
+						active: data.active === true,
+						currentPhase: typeof data.current_phase === "string" ? data.current_phase : undefined,
+						sessionId: effectiveSessionId,
+					});
+				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: JSON.stringify({ success: true, mode, path }),
+							text: JSON.stringify({
+								success: true,
+								mode,
+								path,
+								...(transitionMessage ? { transition: transitionMessage } : {}),
+							}),
 						},
 					],
 				};
@@ -399,6 +472,14 @@ export async function handleStateToolCall(request: {
 					const path = getStatePath(mode, cwd, effectiveSessionId);
 					if (existsSync(path)) {
 						await unlink(path);
+					}
+					if (mode !== SKILL_ACTIVE_STATE_MODE) {
+						await syncCanonicalSkillStateForMode({
+							cwd,
+							mode,
+							active: false,
+							sessionId: effectiveSessionId,
+						});
 					}
 					return {
 						content: [
@@ -416,6 +497,13 @@ export async function handleStateToolCall(request: {
 					if (!existsSync(path)) continue;
 					await unlink(path);
 					removedPaths.push(path);
+				}
+				if (mode !== SKILL_ACTIVE_STATE_MODE) {
+					await syncCanonicalSkillStateForMode({
+						cwd,
+						mode,
+						active: false,
+					});
 				}
 
 				return {
@@ -446,6 +534,7 @@ export async function handleStateToolCall(request: {
 					for (const f of files) {
 						if (!f.endsWith("-state.json")) continue;
 						const mode = f.replace("-state.json", "");
+						if (mode === SKILL_ACTIVE_STATE_MODE) continue;
 						if (seenModes.has(mode)) continue;
 						seenModes.add(mode);
 						try {

@@ -78,7 +78,7 @@ oh-my-codex doctor
 Results: 9 passed, 0 warnings, 0 failed
 ```
 
-## Demo 1: Agent Slash Commands
+## Demo 1: Agent/Skill Keywords
 
 Start Codex CLI in any project directory:
 
@@ -86,22 +86,22 @@ Start Codex CLI in any project directory:
 omx
 ```
 
-Then use agent slash commands:
+Then use role and workflow keywords:
 
 ```
-> /prompts:architect "analyze the authentication module"
+> $architect "analyze the authentication module"
 ```
 
 **Expected:** The architect agent analyzes code with file:line references, root cause diagnosis, and trade-off analysis.
 
 ```
-> /prompts:security-reviewer "review the API endpoints"
+> $security-reviewer "review the API endpoints"
 ```
 
 **Expected:** OWASP Top 10 analysis with severity-prioritized findings and remediation code examples.
 
 ```
-> /prompts:explore "find all database query patterns"
+> $explore "find all database query patterns"
 ```
 
 **Expected:** Structural codebase search with file listings and pattern summaries.
@@ -255,11 +255,12 @@ omx team api transition-task-status --input "{\"team_name\":\"e2e-team-demo\",\"
 ### 7.2 Mailbox/message flow
 
 ```bash
-omx team api send-message --input '{"team_name":"e2e-team-demo","from_worker":"worker-1","to_worker":"leader-fixed","body":"ACK: worker-1 ready"}' --json
+omx team api send-message --input '{"team_name":"e2e-team-demo","from_worker":"leader-fixed","to_worker":"worker-1","body":"ACK: worker-1 ready"}' --json
 omx team api broadcast --input '{"team_name":"e2e-team-demo","from_worker":"leader-fixed","body":"Sync checkpoint"}' --json
-omx team api mailbox-list --input '{"team_name":"e2e-team-demo","worker":"worker-1"}' --json
-omx team api mailbox-mark-notified --input '{"team_name":"e2e-team-demo","worker":"worker-1","message_id":"<MESSAGE_ID>"}' --json
-omx team api mailbox-mark-delivered --input '{"team_name":"e2e-team-demo","worker":"worker-1","message_id":"<MESSAGE_ID>"}' --json
+MAILBOX_JSON=$(omx team api mailbox-list --input '{"team_name":"e2e-team-demo","worker":"worker-1"}' --json)
+MESSAGE_ID=$(echo "$MAILBOX_JSON" | jq -r '.data.messages[0].message_id // empty')
+omx team api mailbox-mark-notified --input "{\"team_name\":\"e2e-team-demo\",\"worker\":\"worker-1\",\"message_id\":\"$MESSAGE_ID\"}" --json
+omx team api mailbox-mark-delivered --input "{\"team_name\":\"e2e-team-demo\",\"worker\":\"worker-1\",\"message_id\":\"$MESSAGE_ID\"}" --json
 ```
 
 ### 7.3 Complete operations matrix (broad coverage)
@@ -352,8 +353,11 @@ echo "[5/8] transition task -> completed"
 omx team api transition-task-status --input "{\"team_name\":\"$TEAM_NAME\",\"task_id\":\"$TASK_ID\",\"from\":\"in_progress\",\"to\":\"completed\",\"claim_token\":\"$CLAIM_TOKEN\"}" --json
 
 echo "[6/8] mailbox flow"
-omx team api send-message --input "{\"team_name\":\"$TEAM_NAME\",\"from_worker\":\"worker-1\",\"to_worker\":\"leader-fixed\",\"body\":\"ACK one-shot\"}" --json
-omx team api mailbox-list --input "{\"team_name\":\"$TEAM_NAME\",\"worker\":\"worker-1\"}" --json
+omx team api send-message --input "{\"team_name\":\"$TEAM_NAME\",\"from_worker\":\"leader-fixed\",\"to_worker\":\"worker-1\",\"body\":\"ACK one-shot\"}" --json
+MAILBOX_JSON=$(omx team api mailbox-list --input "{\"team_name\":\"$TEAM_NAME\",\"worker\":\"worker-1\"}" --json)
+MESSAGE_ID=$(echo "$MAILBOX_JSON" | jq -r '.data.messages[0].message_id // empty')
+omx team api mailbox-mark-notified --input "{\"team_name\":\"$TEAM_NAME\",\"worker\":\"worker-1\",\"message_id\":\"$MESSAGE_ID\"}" --json
+omx team api mailbox-mark-delivered --input "{\"team_name\":\"$TEAM_NAME\",\"worker\":\"worker-1\",\"message_id\":\"$MESSAGE_ID\"}" --json
 
 echo "[7/8] summary envelope check"
 omx team api get-summary --input "{\"team_name\":\"$TEAM_NAME\"}" --json | jq -e '.schema_version == "1.0" and .operation == "get-summary" and .ok == true'

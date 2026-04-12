@@ -2,6 +2,10 @@ import { execFile as execFileCb, execFileSync, spawnSync } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { promisify } from 'util';
+import {
+  assertCurrentTaskBranchAvailable,
+  upsertCurrentTaskBaseline,
+} from './current-task-baseline.js';
 
 const execFilePromise = promisify(execFileCb);
 
@@ -58,7 +62,8 @@ export function isGitRepository(cwd: string): boolean {
   const result = spawnSync('git', ['rev-parse', '--show-toplevel'], {
     cwd,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   return result.status === 0;
 }
 
@@ -77,6 +82,7 @@ function readGit(repoRoot: string, args: string[]): string {
       cwd: repoRoot,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     }).trim();
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { stderr?: string | Buffer };
@@ -93,7 +99,8 @@ function validateBranchName(repoRoot: string, branchName: string): void {
   const result = spawnSync('git', ['check-ref-format', '--branch', branchName], {
     cwd: repoRoot,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   if (result.status === 0) return;
   const stderr = (result.stderr || '').trim();
   throw new Error(stderr || `invalid_worktree_branch:${branchName}`);
@@ -107,11 +114,12 @@ function branchExists(repoRoot: string, branchName: string): boolean {
   return result.status === 0;
 }
 
-function isWorktreeDirty(worktreePath: string): boolean {
+export function isWorktreeDirty(worktreePath: string): boolean {
   const result = spawnSync('git', ['status', '--porcelain'], {
     cwd: worktreePath,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   if (result.status !== 0) {
     const stderr = (result.stderr || '').trim();
     throw new Error(stderr || `worktree_status_failed:${worktreePath}`);
@@ -123,7 +131,8 @@ export function readWorkspaceStatusLines(cwd: string): string[] {
   const result = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
     cwd,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   if (result.status !== 0) {
     const stderr = (result.stderr || '').trim();
     throw new Error(stderr || `workspace_status_failed:${cwd}`);
@@ -233,7 +242,8 @@ function resolveGitCommonDir(cwd: string): string | null {
   const result = spawnSync('git', ['rev-parse', '--git-common-dir'], {
     cwd,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   if (result.status !== 0) return null;
   const value = (result.stdout || '').trim();
   if (!value) return null;
@@ -252,7 +262,8 @@ function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitW
   const headResult = spawnSync('git', ['rev-parse', 'HEAD'], {
     cwd: worktreePath,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   if (headResult.status !== 0) return null;
   const head = (headResult.stdout || '').trim();
   if (!head) return null;
@@ -260,7 +271,8 @@ function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitW
   const branchResult = spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], {
     cwd: worktreePath,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
   const branchRef = branchResult.status === 0 ? (branchResult.stdout || '').trim() : null;
 
   return {
@@ -367,7 +379,7 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
       throw new Error(`worktree_dirty:${plan.worktreePath}`);
     }
 
-    return {
+    const reused = {
       enabled: true,
       repoRoot: plan.repoRoot,
       worktreePath: resolve(plan.worktreePath),
@@ -376,7 +388,18 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
       created: false,
       reused: true,
       createdBranch: false,
-    };
+    } satisfies EnsureWorktreeResult;
+
+    if (plan.branchName) {
+      upsertCurrentTaskBaseline(plan.repoRoot, {
+        branch_name: plan.branchName,
+        worktree_path: reused.worktreePath,
+        base_ref: plan.baseRef,
+        status: 'active',
+      });
+    }
+
+    return reused;
   }
 
   if (existsSync(plan.worktreePath)) {
@@ -385,6 +408,10 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
 
   if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
     throw new Error(`branch_in_use:${plan.branchName}`);
+  }
+
+  if (plan.branchName) {
+    assertCurrentTaskBranchAvailable(plan.repoRoot, plan.branchName, plan.worktreePath);
   }
 
   mkdirSync(dirname(plan.worktreePath), { recursive: true });
@@ -402,7 +429,8 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
   const result = spawnSync('git', addArgs, {
     cwd: plan.repoRoot,
     encoding: 'utf-8',
-  });
+      windowsHide: true,
+    });
 
   if (result.status !== 0) {
     const stderr = (result.stderr || '').trim();
@@ -412,7 +440,7 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
     throw new Error(stderr || `worktree_add_failed:${addArgs.join(' ')}`);
   }
 
-  return {
+  const ensured = {
     enabled: true,
     repoRoot: plan.repoRoot,
     worktreePath: resolve(plan.worktreePath),
@@ -421,7 +449,18 @@ export function ensureWorktree(plan: PlannedWorktreeTarget | { enabled: false })
     created: true,
     reused: false,
     createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-  };
+  } satisfies EnsureWorktreeResult;
+
+  if (plan.branchName) {
+    upsertCurrentTaskBaseline(plan.repoRoot, {
+      branch_name: plan.branchName,
+      worktree_path: ensured.worktreePath,
+      base_ref: plan.baseRef,
+      status: 'active',
+    });
+  }
+
+  return ensured;
 }
 
 export interface RollbackWorktreeOptions {
@@ -476,4 +515,11 @@ export async function rollbackProvisionedWorktrees(
   if (errors.length > 0) {
     throw new Error(`worktree_rollback_failed:${errors.join(' | ')}`);
   }
+}
+
+export async function removeWorktreeForce(repoRoot: string, worktreePath: string): Promise<void> {
+  await execFilePromise('git', ['worktree', 'remove', '--force', worktreePath], {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+  });
 }

@@ -28,22 +28,44 @@ In this repository, `prompts/*.md` remain the canonical source files even when t
 
 This document is the contributor-oriented index for those surfaces.
 
+## Exact-model mini adaptation seam
+
+OMX also has a narrow **instruction-composition seam** for subagents/workers whose **final resolved model** is exactly `gpt-5.4-mini`.
+That seam is part of prompt delivery, but it is intentionally narrower than the general GPT-5.4 behavioral contract described below.
+
+Contributor rules for that seam:
+
+- Key mini-specific instruction adaptation off the **final resolved model string**, not off role name, lane, or default tier membership.
+- Use **exact string equality** for `gpt-5.4-mini`; do not widen behavior to `gpt-5.4`, `gpt-5.4-mini-tuned`, or other variants.
+- Keep one shared **inner role-instruction composition helper** as the source of truth for model-gated prompt adaptation.
+- Keep `src/team/worker-bootstrap.ts` limited to **outer AGENTS/runtime wrapping**. It should wrap already-composed instructions, not own model-specific adaptation logic.
+- Keep `src/team/role-router.ts` as a raw role-prompt loader unless a minimal plumbing change is unavoidable.
+
+Primary implementation surfaces for this seam:
+
+| Responsibility | Primary sources |
+|---|---|
+| shared inner prompt composition | `src/agents/native-config.ts`, `src/agents/__tests__/native-config.test.ts` |
+| team runtime/scaling plumbing | `src/team/runtime.ts`, `src/team/scaling.ts`, associated runtime/scaling tests |
+| outer wrapper boundary | `src/team/worker-bootstrap.ts`, `src/team/__tests__/worker-bootstrap.test.ts` |
+
+
 ## What this contract is — and is not
 
 This contract is about **how OMX prompts should behave**.
 It is not the same thing as OMX's routing metadata.
 
-- **Behavioral contract:** compact output defaults, automatic follow-through, localized task updates, persistent tool use, and evidence-backed completion.
+- **Behavioral contract:** quality-first intent-deepening defaults, automatic follow-through, localized task updates, persistent tool use, and evidence-backed completion.
 - **Adjacent but separate routing layer:** role/tier/posture metadata such as `frontier-orchestrator`, `deep-worker`, and `fast-lane` in `src/agents/native-config.ts` and `docs/shared/agent-tiers.md`.
 
 If you are changing prompt prose, use this document first.
 If you are changing routing metadata or native config overlays, use the routing docs/tests first.
 
-## The 4 core GPT-5.4 patterns OMX currently enforces
+## The 4 core GPT-5.4 patterns OMX should now enforce
 
-### 1. Compact, information-dense output by default
+### 1. Quality-first, intent-deepening output by default
 
-Contributors should preserve the default posture of concise outputs that still include the evidence needed to act safely.
+Contributors should preserve the default posture of quality-first outputs that dig deeper into intent, think one more step before asking, and still include the evidence needed to act safely.
 
 Representative locations:
 
@@ -58,9 +80,9 @@ Representative locations:
 
 Example prompt text:
 
-> - Default to compact, information-dense responses; expand only when risk, ambiguity, or the user explicitly calls for detail.
+> - Default to quality-first, intent-deepening responses; think one more step before replying or asking for clarification, and use as much detail as needed for a strong result without empty verbosity.
 >
-> - Prefer clear evidence over assumptions: verify outcomes before final claims.
+> - More effort does not mean reflexive web/tool escalation; use tools when they materially improve the result.
 
 ### 2. Automatic follow-through on clear, low-risk, reversible next steps
 
@@ -127,6 +149,15 @@ Example prompt text:
 >
 > Verification loop: identify what proves the claim, run the verification, read the output, then report with evidence.
 
+## Orchestration sharpness rules for root AGENTS surfaces
+
+When editing `AGENTS.md`, `templates/AGENTS.md`, or other root orchestration guidance, keep the orchestration contract mode-driven and terse:
+
+1. **Mode selection comes first.** Distinguish between `$deep-interview`, `$ralplan`, `$team`, and direct solo execution instead of blending them into one generic flow.
+2. **Leader and worker responsibilities stay separate.** Leaders choose the mode, own verification, and integrate work; workers execute assigned slices and report blockers upward.
+3. **Stop/escalate rules are explicit.** The prompt should say when to stop, when to escalate to the user, and when workers must escalate back to the leader.
+4. **Output contract stays tight.** Default progress/final updates should be compact: current mode, action/result, and evidence or blocker/next step. Avoid repeating full-plan rationale unless the risk or decision changed.
+
 ## Reinforcement pattern: scenario examples
 
 OMX also uses **scenario-style examples** to make the contract concrete for "continue", "make a PR", and "merge if CI green" flows.
@@ -158,13 +189,14 @@ Keep these separate when editing docs and prompts:
 | Topic | Primary sources |
 |---|---|
 | GPT-5.4 prompt behavior contract | `AGENTS.md`, `templates/AGENTS.md`, canonical XML-tagged role prompt surfaces in `prompts/*.md`, `src/config/generator.ts`, `src/hooks/__tests__/prompt-guidance-*.test.ts` |
+| exact-model mini composition seam | `src/agents/native-config.ts`, `src/team/runtime.ts`, `src/team/scaling.ts`, `src/team/worker-bootstrap.ts`, targeted native/runtime/scaling/bootstrap tests |
 | role/tier/posture routing | `README.md:133-179`, `docs/shared/agent-tiers.md:7-56`, `src/agents/native-config.ts:12-40` |
 
 If a change only affects posture overlays or native agent metadata, document it in the routing docs rather than expanding this contract unnecessarily.
 
 ## Canonical role prompts vs specialized behavior prompts
 
-The main role catalog is the installable specialized-agent set used by `/prompts:name` and native agent generation.
+The main role catalog is the installable specialized-agent set used by native agent generation and internal role prompt composition.
 
 - Files like `prompts/executor.md`, `prompts/planner.md`, and `prompts/architect.md` are canonical XML-tagged role prompt surfaces.
 - `prompts/sisyphus-lite.md` should be treated as a specialized worker-behavior prompt, not as a first-class main catalog role.
@@ -174,11 +206,12 @@ The main role catalog is the installable specialized-agent set used by `/prompts
 
 Before opening a PR that changes prompt text, confirm all of the following:
 
-1. **Preserve the four core behaviors.** Your change should keep or strengthen compact output, low-risk follow-through, scoped overrides, and grounded tool use/verification.
+1. **Preserve the four core behaviors.** Your change should keep or strengthen quality-first intent-deepening output, low-risk follow-through, scoped overrides, and grounded tool use/verification.
 2. **Keep role-specific wording role-specific.** The phrasing can differ by role, but the behavior should stay semantically aligned.
 3. **Update scenario examples when behavior changes.** If you change how prompts handle `continue`, `make a PR`, or `merge if CI green`, update the prompt examples and the related tests.
-4. **Do not confuse routing metadata with prompt behavior.** Posture/tier updates belong in routing docs/tests unless they also change prompt prose.
-5. **Update regression coverage when the contract changes.** Start with `src/hooks/__tests__/prompt-guidance-contract.test.ts`, `prompt-guidance-wave-two.test.ts`, `prompt-guidance-scenarios.test.ts`, and `prompt-guidance-catalog.test.ts`.
+4. **Keep the mini-only seam exact and centralized.** If you touch mini adaptation, gate it on the final resolved model with exact `gpt-5.4-mini` equality, keep the shared inner helper as the source of truth, and keep `worker-bootstrap.ts` wrapper-only.
+5. **Do not confuse routing metadata with prompt behavior.** Posture/tier updates belong in routing docs/tests unless they also change prompt prose.
+6. **Update regression coverage when the contract changes.** Start with `src/hooks/__tests__/prompt-guidance-contract.test.ts`, `prompt-guidance-wave-two.test.ts`, `prompt-guidance-scenarios.test.ts`, and `prompt-guidance-catalog.test.ts`; add native/runtime/scaling/bootstrap coverage when the mini-only seam changes.
 
 ## Validation workflow for contributors
 
@@ -191,6 +224,16 @@ node --test \
   dist/hooks/__tests__/prompt-guidance-wave-two.test.js \
   dist/hooks/__tests__/prompt-guidance-scenarios.test.js \
   dist/hooks/__tests__/prompt-guidance-catalog.test.js
+```
+
+If you touch the exact-model `gpt-5.4-mini` composition seam, also run:
+
+```bash
+node --test \
+  dist/agents/__tests__/native-config.test.js \
+  dist/team/__tests__/runtime.test.js \
+  dist/team/__tests__/scaling.test.js \
+  dist/team/__tests__/worker-bootstrap.test.js
 ```
 
 For broader prompt or skill changes, prefer the full suite:

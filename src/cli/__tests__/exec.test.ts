@@ -14,12 +14,16 @@ function runOmx(
 ): { status: number | null; stdout: string; stderr: string; error: string } {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
-  const omxBin = join(repoRoot, 'bin', 'omx.js');
+  const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
   const result = spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: 'utf-8',
     env: {
       ...process.env,
+      OMX_MODEL_INSTRUCTIONS_FILE: '',
+      OMX_TEAM_WORKER: '',
+      OMX_TEAM_STATE_ROOT: '',
+      OMX_TEAM_LEADER_CWD: '',
       ...envOverrides,
     },
   });
@@ -38,6 +42,7 @@ describe('omx exec', () => {
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
 
       await mkdir(join(home, '.codex'), { recursive: true });
       await mkdir(fakeBin, { recursive: true });
@@ -62,6 +67,8 @@ describe('omx exec', () => {
         ].join('\n'),
       );
       await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
 
       const result = runOmx(wd, ['exec', '--model', 'gpt-5', 'say hi'], {
         HOME: home,
@@ -96,11 +103,14 @@ describe('omx exec', () => {
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
       await writeFile(fakeCodexPath, '#!/bin/sh\nprintf \'fake-codex:%s\\n\' \"$*\"\n');
       await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
 
       const result = runOmx(wd, ['exec', '--help'], {
         HOME: home,

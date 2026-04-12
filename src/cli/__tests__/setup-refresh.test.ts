@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdtemp,
   mkdir,
@@ -12,6 +13,18 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setup } from "../setup.js";
+
+const EXPECTED_PROJECT_GITIGNORE = [
+  ".omx/",
+  ".codex/*",
+  "!.codex/agents/",
+  "!.codex/agents/**",
+  "!.codex/skills/",
+  "!.codex/skills/**",
+  ".codex/skills/.system/**",
+  "!.codex/prompts/",
+  "!.codex/prompts/**",
+].join("\n") + "\n";
 
 async function runSetupWithCapturedLogs(
   cwd: string,
@@ -95,19 +108,22 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     }
   });
 
-  it("creates .gitignore with a .omx/ entry during project-scoped setup", async () => {
+  it("creates .gitignore with OMX project ignore rules during project-scoped setup", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {
       await runSetupInTempDir(wd, { scope: "project" });
 
       assert.equal(existsSync(join(wd, ".omx", "state")), true);
-      assert.equal(await readFile(join(wd, ".gitignore"), "utf-8"), ".omx/\n");
+      assert.equal(
+        await readFile(join(wd, ".gitignore"), "utf-8"),
+        EXPECTED_PROJECT_GITIGNORE,
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it("appends .omx/ to an existing project .gitignore without duplicating it", async () => {
+  it("appends missing OMX project ignore rules to an existing project .gitignore without duplicating them", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {
       await writeFile(join(wd, ".gitignore"), "node_modules/\n");
@@ -116,8 +132,64 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await runSetupInTempDir(wd, { scope: "project" });
 
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
-      assert.equal(gitignore, "node_modules/\n.omx/\n");
+      assert.equal(gitignore, `node_modules/\n${EXPECTED_PROJECT_GITIGNORE}`);
       assert.equal(gitignore.match(/^\.omx\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.codex\/\*$/gm)?.length ?? 0, 1);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores project-local config while keeping .codex agents, skills, and prompts trackable", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      const initResult = spawnSync("git", ["init", "-q"], { cwd: wd });
+      assert.equal(initResult.status, 0);
+
+      await runSetupInTempDir(wd, { scope: "project" });
+      await mkdir(join(wd, ".codex", "skills", ".system"), { recursive: true });
+      await writeFile(join(wd, ".codex", "agents", "local.toml"), "# local\n");
+      await writeFile(join(wd, ".codex", "prompts", "local.md"), "# local\n");
+      await writeFile(
+        join(wd, ".codex", "skills", ".system", "cache.json"),
+        "{}\n",
+      );
+
+      const status = spawnSync(
+        "git",
+        [
+          "status",
+          "--short",
+          "--ignored",
+          ".codex/config.toml",
+          ".codex/agents/local.toml",
+          ".codex/prompts/local.md",
+          ".codex/skills/help/SKILL.md",
+          ".codex/skills/.system/cache.json",
+        ],
+        { cwd: wd, encoding: "utf-8" },
+      );
+      assert.equal(status.status, 0);
+      assert.match(status.stdout, /^!! \.codex\/config\.toml$/m);
+      assert.match(status.stdout, /^\?\? \.codex\/agents\/local\.toml$/m);
+      assert.match(status.stdout, /^\?\? \.codex\/prompts\/local\.md$/m);
+      assert.match(status.stdout, /^\?\? \.codex\/skills\/help\/SKILL\.md$/m);
+      assert.match(status.stdout, /^!! \.codex\/skills\/\.system\/cache\.json$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces legacy .codex/ ignores so the project allowlist can take effect", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await writeFile(join(wd, ".gitignore"), ".omx/\n.codex/\n");
+
+      await runSetupInTempDir(wd, { scope: "project" });
+
+      const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
+      assert.equal(gitignore, EXPECTED_PROJECT_GITIGNORE);
+      assert.equal(gitignore.match(/^\.codex\/$/gm)?.length ?? 0, 0);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -232,6 +304,52 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     }
   });
 
+  it("skips OMX-managed [tui] writes for Codex CLI >= 0.107.0 and preserves an existing [tui] table", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await mkdir(join(wd, ".omx", "state"), { recursive: true });
+      await mkdir(join(wd, ".codex"), { recursive: true });
+      await writeFile(
+        join(wd, ".codex", "config.toml"),
+        ['model = "gpt-5.4"', "", "[tui]", 'theme = "night"', 'status_line = ["git-branch"]', ""].join("\n"),
+      );
+
+      const output = await runSetupWithCapturedLogs(wd, {
+        scope: "project",
+        codexVersionProbe: () => "codex-cli 0.107.0",
+      });
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.equal(config.match(/^\[tui\]$/gm)?.length ?? 0, 1);
+      assert.match(config, /^theme = "night"$/m);
+      assert.match(config, /^status_line = \["git-branch"\]$/m);
+      assert.match(
+        output,
+        /Codex CLI >= 0\.107\.0 manages \[tui\]; OMX left that section untouched\./,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps OMX-managed [tui] writes for older Codex CLI versions", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await mkdir(join(wd, ".omx", "state"), { recursive: true });
+
+      const output = await runSetupWithCapturedLogs(wd, {
+        scope: "project",
+        codexVersionProbe: () => "codex-cli 0.106.0",
+      });
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.match(config, /^\[tui\]$/m);
+      assert.match(output, /StatusLine configured in config\.toml via \[tui\] section\./);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("syncs shared MCP registry entries into config.toml during setup", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {
@@ -258,6 +376,60 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+
+  it("backfills launcher-backed MCP startup timeouts during setup refresh", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await mkdir(join(wd, ".omx", "state"), { recursive: true });
+      await mkdir(join(wd, ".codex"), { recursive: true });
+      await writeFile(
+        join(wd, ".codex", "config.toml"),
+        [
+          '[mcp_servers.filesystem]',
+          'command = "npx"',
+          'args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]',
+          "",
+        ].join("\n"),
+      );
+
+      await runSetupInTempDir(wd, { scope: "project" });
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.match(config, /^\[mcp_servers\.filesystem\]$/m);
+      assert.match(config, /^startup_timeout_sec = 15$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs retired omx_team_run config during setup refresh", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await mkdir(join(wd, ".omx", "state"), { recursive: true });
+      await mkdir(join(wd, ".codex"), { recursive: true });
+      await writeFile(
+        join(wd, ".codex", "config.toml"),
+        [
+          '[mcp_servers.omx_team_run]',
+          'command = "node"',
+          'args = ["./dist/cli/team-mcp.js"]',
+          "",
+        ].join("\n"),
+      );
+
+      const output = await runSetupWithCapturedLogs(wd, { scope: "project" });
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.match(
+        output,
+        /Removed retired \[mcp_servers\.omx_team_run\] config during refresh\./,
+      );
+      assert.doesNotMatch(config, /^\[mcp_servers\.omx_team_run\]$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("syncs shared MCP registry entries into ~/.claude/settings.json for user scope", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     const previousHome = process.env.HOME;
@@ -274,8 +446,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
           {
             uiTheme: "dark",
             mcpServers: {
-              gitnexus: {
-                command: "custom-gitnexus",
+              existing_server: {
+                command: "custom-existing-server",
                 args: ["serve"],
                 enabled: true,
               },
@@ -289,7 +461,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await writeFile(
         registryPath,
         JSON.stringify({
-          gitnexus: { command: "gitnexus", args: ["mcp"] },
+          existing_server: { command: "existing-server", args: ["mcp"] },
           eslint: { command: "npx", args: ["@eslint/mcp@latest"], enabled: false },
         }),
       );
@@ -306,8 +478,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
         mcpServers?: Record<string, { command: string; args: string[]; enabled: boolean }>;
       };
       assert.equal(settings.uiTheme, "dark");
-      assert.deepEqual(settings.mcpServers?.gitnexus, {
-        command: "custom-gitnexus",
+      assert.deepEqual(settings.mcpServers?.existing_server, {
+        command: "custom-existing-server",
         args: ["serve"],
         enabled: true,
       });
@@ -370,15 +542,15 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await writeFile(
         join(wd, ".omc", "mcp-registry.json"),
         JSON.stringify({
-          gitnexus: { command: "gitnexus", args: ["mcp"] },
+          legacy_helper: { command: "legacy-helper", args: ["mcp"] },
         }),
       );
 
       await runSetupInTempDir(wd, { scope: "project" });
 
       const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
-      assert.doesNotMatch(config, /^\[mcp_servers\.gitnexus\]$/m);
-      assert.doesNotMatch(config, /Shared MCP Server: gitnexus/);
+      assert.doesNotMatch(config, /^\[mcp_servers\.legacy_helper\]$/m);
+      assert.doesNotMatch(config, /Shared MCP Server: legacy_helper/);
 
       const output = await runSetupWithCapturedLogs(wd, { scope: "project" });
       assert.match(output, /legacy shared MCP registry detected at .*\.omc\/mcp-registry\.json but ignored by default/i);

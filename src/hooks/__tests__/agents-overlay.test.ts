@@ -72,30 +72,27 @@ describe("generateOverlay", () => {
     assert.doesNotMatch(defaultOverlay, /\*\*Orchestration Mode:\*\* team/);
   });
 
-  it("adds advisory explore routing guidance only when USE_OMX_EXPLORE_CMD is enabled", async () => {
+  it("adds advisory explore routing guidance by default and hides it only on explicit opt-out", async () => {
     const previous = process.env.USE_OMX_EXPLORE_CMD;
     try {
       delete process.env.USE_OMX_EXPLORE_CMD;
+      const defaultOverlay = await generateOverlay(
+        tempDir,
+        "explore-routing-default",
+      );
+      assert.match(
+        defaultOverlay,
+        /\*\*Explore Command Preference:\*\*/,
+      );
+      assert.match(defaultOverlay, /default-on; opt out/i);
+      assert.match(defaultOverlay, /omx explore` FIRST before attempting full code analysis/i);
+
+      process.env.USE_OMX_EXPLORE_CMD = "off";
       const disabledOverlay = await generateOverlay(
         tempDir,
         "explore-routing-off",
       );
-      assert.doesNotMatch(
-        disabledOverlay,
-        /\*\*Explore Command Preference:\*\*/,
-      );
-
-      process.env.USE_OMX_EXPLORE_CMD = "1";
-      const enabledOverlay = await generateOverlay(
-        tempDir,
-        "explore-routing-on",
-      );
-      assert.match(
-        enabledOverlay,
-        /\*\*Explore Command Preference:\*\* enabled via `USE_OMX_EXPLORE_CMD`/,
-      );
-      assert.match(enabledOverlay, /strongly prefer `omx explore`/);
-      assert.match(enabledOverlay, /advisory steering/i);
+      assert.doesNotMatch(disabledOverlay, /\*\*Explore Command Preference:\*\*/);
     } finally {
       if (typeof previous === "string")
         process.env.USE_OMX_EXPLORE_CMD = previous;
@@ -137,6 +134,41 @@ describe("generateOverlay", () => {
     const overlay = await generateOverlay(tempDir, "sess1");
     assert.ok(overlay.includes("team"));
     assert.ok(overlay.includes("iteration 1/5"));
+  });
+
+  it("lists both approved combined workflow members from canonical skill state", async () => {
+    const sessionId = "combined-session";
+    const sessionDir = join(tempDir, ".omx", "state", "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(tempDir, ".omx", "state", "session.json"),
+      JSON.stringify({ session_id: sessionId }),
+    );
+    await writeFile(
+      join(sessionDir, "skill-active-state.json"),
+      JSON.stringify({
+        active: true,
+        skill: "team",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [
+          { skill: "team", phase: "running", active: true, session_id: sessionId },
+          { skill: "ralph", phase: "executing", active: true, session_id: sessionId },
+        ],
+      }),
+    );
+    await writeFile(
+      join(sessionDir, "team-state.json"),
+      JSON.stringify({ active: true, current_phase: "running" }),
+    );
+    await writeFile(
+      join(sessionDir, "ralph-state.json"),
+      JSON.stringify({ active: true, iteration: 2, max_iterations: 5, current_phase: "executing" }),
+    );
+
+    const overlay = await generateOverlay(tempDir, sessionId);
+    assert.match(overlay, /- team: phase: running/);
+    assert.match(overlay, /- ralph: iteration 2\/5, phase: executing/);
   });
 
   it("generates overlay with notepad priority content", async () => {
@@ -368,6 +400,35 @@ describe("resolveSessionOrchestrationMode", () => {
 
     const mode = await resolveSessionOrchestrationMode(tempDir, sessionId);
     assert.equal(mode, "team");
+  });
+
+  it("active mode summary follows canonical session skill state instead of stale root mode files", async () => {
+    const sessionId = "sess-active-summary";
+    const rootStateDir = join(tempDir, ".omx", "state");
+    const sessionDir = join(rootStateDir, "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(rootStateDir, "ralph-state.json"),
+      JSON.stringify({ active: true, iteration: 9, max_iterations: 10, current_phase: "stale-root" }),
+    );
+    await writeFile(
+      join(sessionDir, "skill-active-state.json"),
+      JSON.stringify({
+        active: true,
+        skill: "team",
+        phase: "running",
+        session_id: sessionId,
+        active_skills: [{ skill: "team", phase: "running", active: true, session_id: sessionId }],
+      }),
+    );
+    await writeFile(
+      join(sessionDir, "team-state.json"),
+      JSON.stringify({ active: true, team_name: "delta" }),
+    );
+
+    const overlay = await generateOverlay(tempDir, sessionId);
+    assert.ok(overlay.includes("- team: phase: running"));
+    assert.equal(overlay.includes("ralph"), false);
   });
 });
 

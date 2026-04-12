@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveCanonicalTeamStateRoot } from '../team/state-root.js';
 
 const __bridge_dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -76,7 +77,7 @@ export type RuntimeEvent =
   | { event: 'DispatchFailed'; request_id: string; reason: string }
   | { event: 'ReplayRequested'; cursor?: string }
   | { event: 'SnapshotCaptured' }
-  | { event: 'MailboxMessageCreated'; message_id: string; from_worker: string; to_worker: string }
+  | { event: 'MailboxMessageCreated'; message_id: string; from_worker: string; to_worker: string; body?: string }
   | { event: 'MailboxNotified'; message_id: string }
   | { event: 'MailboxDelivered'; message_id: string };
 
@@ -108,6 +109,31 @@ export interface MailboxRecord {
 
 let schemaValidated = false;
 
+export interface RuntimeBinaryDiscoveryOptions {
+  debugPath?: string;
+  releasePath?: string;
+  fallbackBinary?: string;
+  exists?: (path: string) => boolean;
+}
+
+export function resolveRuntimeBinaryPath(options: RuntimeBinaryDiscoveryOptions = {}): string {
+  const exists = options.exists ?? existsSync;
+  const envOverride = process.env.OMX_RUNTIME_BINARY?.trim();
+  if (envOverride) return envOverride;
+
+  const workspaceDebug = options.debugPath ?? resolve(__bridge_dirname, '../../target/debug/omx-runtime');
+  if (exists(workspaceDebug)) return workspaceDebug;
+
+  const workspaceRelease = options.releasePath ?? resolve(__bridge_dirname, '../../target/release/omx-runtime');
+  if (exists(workspaceRelease)) return workspaceRelease;
+
+  return options.fallbackBinary ?? 'omx-runtime';
+}
+
+export function resolveBridgeStateDir(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  return resolveCanonicalTeamStateRoot(cwd, env);
+}
+
 export class RuntimeBridge {
   private binaryPath: string;
   private stateDir: string | undefined;
@@ -116,7 +142,7 @@ export class RuntimeBridge {
   constructor(options: { stateDir?: string; binaryPath?: string } = {}) {
     this.enabled = process.env.OMX_RUNTIME_BRIDGE !== '0';
     this.stateDir = options.stateDir;
-    this.binaryPath = options.binaryPath ?? this.discoverBinary();
+    this.binaryPath = options.binaryPath ?? resolveRuntimeBinaryPath();
   }
 
   /** Whether the bridge is enabled (OMX_RUNTIME_BRIDGE != '0'). */
@@ -195,18 +221,6 @@ export class RuntimeBridge {
   // Private helpers
   // -------------------------------------------------------------------------
 
-  private discoverBinary(): string {
-    // Check workspace-local build first (crates/ layout)
-    const workspaceDebug = resolve(__bridge_dirname, '../../target/debug/omx-runtime');
-    if (existsSync(workspaceDebug)) return workspaceDebug;
-
-    const workspaceRelease = resolve(__bridge_dirname, '../../target/release/omx-runtime');
-    if (existsSync(workspaceRelease)) return workspaceRelease;
-
-    // Fall back to PATH
-    return 'omx-runtime';
-  }
-
   private validateSchemaOnce(): void {
     if (schemaValidated) return;
     try {
@@ -240,7 +254,8 @@ export class RuntimeBridge {
         encoding: 'utf-8',
         timeout: 10_000,
         maxBuffer: 1024 * 1024,
-      });
+      windowsHide: true,
+    });
       return result;
     } catch (err: unknown) {
       const execErr = err as { stderr?: string; message?: string };
@@ -257,6 +272,9 @@ export class RuntimeBridge {
 let _defaultBridge: RuntimeBridge | undefined;
 
 export function getDefaultBridge(stateDir?: string): RuntimeBridge {
+  if (stateDir) {
+    return new RuntimeBridge({ stateDir });
+  }
   if (!_defaultBridge) {
     _defaultBridge = new RuntimeBridge({ stateDir });
   }

@@ -1,81 +1,79 @@
-# oh-my-codex v0.10.3
+# oh-my-codex v0.12.5
 
-**21 PRs in the release window**
+**Team-runtime and multi-workflow state hardening, Windows reliability, tmux/shell stability, and HUD session anchoring**
 
-`0.10.3` is a feature-rich release following `0.10.2`. The release window began with the `0.10.2` tag at `2026-03-16 09:14 UTC`; the 21 PRs landed across two days, with the final merge (`#919`) at `2026-03-18 02:24 UTC`, for a shipped turnaround of about **41 hours** before this release-prep commit.
+`0.12.5` is a broad stability patch across 25 PRs and 74 files changed. It resolves a cluster of inter-related session-scoping, team startup/shutdown, Windows worker-path, and tmux cwd bugs that accumulated since `0.12.4`, adds current-task baseline branch guardrails for team workers, and tightens multi-workflow state management.
 
 ## Highlights
 
-### Native subagent integration (phase 1)
-
-- Codex CLI native subagent spawning and coordination is now available as a first-pass integration
-- Skill references can bridge to native subagents with full lifecycle tracking
-- AGENTS.md setup now auto-generates a model capability table for quick reference
-
-### Autoresearch hardening and UX
-
-- Novice users can now be routed through deep-interview intake before launching autonomous research
-- Worktree paths moved to project-local `.omx/worktrees/` for isolation
-- Contracts and runtime deslopped for clarity
-- ESM `__dirname` error and macOS test compatibility fixed
-
-- Marathon execution mode with watchdog failure notifications, structured PRD orchestrator, and state recovery
-
-### New: `omx cleanup`
-
-- Detects and removes orphaned MCP server processes
-- Cleans stale `/tmp` artifacts
-
-### Security
-
-- High-severity transitive vulnerabilities patched with dependabot config added
+- **Multi-skill planning state preserved** — `ralplan`/`ralph` state no longer drops when a mixed-workflow prompt is re-routed mid-flight (#1471).
+- **Team startup recovery** — workers that stall early during boot no longer hang the entire team launch sequence (#1444).
+- **Windows reliability** — split-pane shutdown targeting, psmux launcher resolution, MCP orphan cleanup, and retired-config repair are all fixed (#1470, #1469, #1437, #1436).
+- **tmux/shell cwd correctness** — detached tmux panes, worker shell launches, and Homebrew zsh paths now all honour the requested working directory (#1468, #1460, #1462).
+- **HUD and session anchoring** — HUD state is now strictly scoped to the active OMX session; native session-id drift no longer hides transport failures (#1453, #1458).
+- **Ralph stop-hook session isolation** — stop-hook leakage across sessions is eliminated (#1466).
+- **Current-task baseline guardrails** — new per-task baseline branch tracking keeps team workers anchored to their correct starting commit (#1419).
 
 ## What's Changed
 
-### Features
-- feat: add Lore commit protocol to AGENTS.md template and executor prompt ([#916](https://github.com/Yeachan-Heo/oh-my-codex/pull/916))
-- feat(setup): generate AGENTS model capability table ([#894](https://github.com/Yeachan-Heo/oh-my-codex/pull/894))
-- feat: add skill_ref bridges and subagent tracking ([#892](https://github.com/Yeachan-Heo/oh-my-codex/pull/892))
-- feat: add native codex agent integration phase 1 ([#886](https://github.com/Yeachan-Heo/oh-my-codex/pull/886))
-- feat: add AGENTS autonomy directive ([#883](https://github.com/Yeachan-Heo/oh-my-codex/pull/883))
-- feat(autoresearch): add novice deep-interview intake bridge ([#906](https://github.com/Yeachan-Heo/oh-my-codex/pull/906))
-- feat(cli): add omx cleanup for orphaned MCP servers ([#901](https://github.com/Yeachan-Heo/oh-my-codex/pull/901))
+### Added
+- Current-task baseline branch guardrails for team workers (PR [#1419](https://github.com/Yeachan-Heo/oh-my-codex/pull/1419))
+- Approved multi-workflow overlap support in canonical state (PR [#1427](https://github.com/Yeachan-Heo/oh-my-codex/pull/1427))
+- Windows `ps` fallback for notify hooks (PR [#1457](https://github.com/Yeachan-Heo/oh-my-codex/pull/1457))
 
-### Fixes
-- fix: bootstrap packed-install smoke deps in worktrees ([#919](https://github.com/Yeachan-Heo/oh-my-codex/pull/919), closes [#917](https://github.com/Yeachan-Heo/oh-my-codex/issues/917))
-- fix: use deep-interview launch for autoresearch intake ([#915](https://github.com/Yeachan-Heo/oh-my-codex/pull/915), closes [#911](https://github.com/Yeachan-Heo/oh-my-codex/issues/911))
-- fix(native): prefer musl Linux assets before glibc ([#914](https://github.com/Yeachan-Heo/oh-my-codex/pull/914))
-- fix(autoresearch): use project-local worktree paths ([#913](https://github.com/Yeachan-Heo/oh-my-codex/pull/913))
-- fix: ship musl-first Linux native assets ([#907](https://github.com/Yeachan-Heo/oh-my-codex/pull/907))
-- fix: resolve __dirname ESM error in autoresearch guided flow ([#903](https://github.com/Yeachan-Heo/oh-my-codex/pull/903))
-- fix: clean up stale obsolete native agents ([#899](https://github.com/Yeachan-Heo/oh-my-codex/pull/899))
-- fix: stop generating skill agents ([#897](https://github.com/Yeachan-Heo/oh-my-codex/pull/897))
-- fix(autoresearch): replace execFileSync('cat') with readFileSync and fix macOS test compatibility ([#891](https://github.com/Yeachan-Heo/oh-my-codex/pull/891) — @lifrary)
-- fix(deps): patch high-severity transitive vulnerabilities and add dependabot config ([#889](https://github.com/Yeachan-Heo/oh-my-codex/pull/889), closes [#888](https://github.com/Yeachan-Heo/oh-my-codex/issues/888))
-- Add stale /tmp cleanup to omx cleanup ([#912](https://github.com/Yeachan-Heo/oh-my-codex/pull/912), closes [#908](https://github.com/Yeachan-Heo/oh-my-codex/issues/908))
+### Fixed — Team startup / shutdown
+- Stalled-worker startup no longer hangs team boot (PR [#1444](https://github.com/Yeachan-Heo/oh-my-codex/pull/1444))
+- Cross-session stale root team Stop blocking eliminated (PR [#1451](https://github.com/Yeachan-Heo/oh-my-codex/pull/1451))
+- Linux tmux startup handoff and shutdown-state persistence (PR [#1438](https://github.com/Yeachan-Heo/oh-my-codex/pull/1438))
+- `session.json` ownership and fallback semantics tightened (PR [#1447](https://github.com/Yeachan-Heo/oh-my-codex/pull/1447))
 
-### Refactor
-- refactor(autoresearch): deslop contracts and runtime ([#918](https://github.com/Yeachan-Heo/oh-my-codex/pull/918))
+### Fixed — Multi-skill / workflow state
+- Planning state preserved in mixed workflow prompt routing (PR [#1471](https://github.com/Yeachan-Heo/oh-my-codex/pull/1471))
+- Workflow handoff correctness and state-model documentation (PR [#1442](https://github.com/Yeachan-Heo/oh-my-codex/pull/1442))
+- Flaky hook and HUD state scope alignment (PR [#1446](https://github.com/Yeachan-Heo/oh-my-codex/pull/1446))
+
+### Fixed — Windows
+- Split-pane shutdown stale leader-pane targeting (PR [#1470](https://github.com/Yeachan-Heo/oh-my-codex/pull/1470))
+- Native psmux worker startup launcher resolution (PR [#1469](https://github.com/Yeachan-Heo/oh-my-codex/pull/1469))
+- MCP orphan cleanup on parent shutdown (PR [#1437](https://github.com/Yeachan-Heo/oh-my-codex/pull/1437))
+- Retired team MCP config repair on upgrade (PR [#1436](https://github.com/Yeachan-Heo/oh-my-codex/pull/1436))
+
+### Fixed — tmux / macOS / shell
+- Detached tmux launch cwd loss (PR [#1468](https://github.com/Yeachan-Heo/oh-my-codex/pull/1468))
+- Worker cwd preserved on supported shell launches (PR [#1460](https://github.com/Yeachan-Heo/oh-my-codex/pull/1460))
+- Homebrew zsh tmux pane shell normalization on macOS (PR [#1462](https://github.com/Yeachan-Heo/oh-my-codex/pull/1462))
+- tmux startup PID resolution and copy-mode cleanup hardening (PR [#1459](https://github.com/Yeachan-Heo/oh-my-codex/pull/1459))
+
+### Fixed — HUD / session anchoring
+- HUD state anchored to active OMX session scope (PR [#1453](https://github.com/Yeachan-Heo/oh-my-codex/pull/1453))
+- Native session-id drift no longer hides team transport failures (PR [#1458](https://github.com/Yeachan-Heo/oh-my-codex/pull/1458))
+
+### Fixed — deep-interview
+- Stop auto-continuation no longer fires during the deep-interview intent-first questioning phase; that phase is now treated as planning for stall detection (PR [#1473](https://github.com/Yeachan-Heo/oh-my-codex/pull/1473), issue [#1472](https://github.com/Yeachan-Heo/oh-my-codex/issues/1472))
+
+### Fixed — Explore harness
+- `omx explore` now emits a clear actionable error when cargo is a rustup shim with no default toolchain, instead of surfacing the raw rustup message (`src/cli/explore.ts`)
+
+### Fixed — Hooks / auth / notify
+- Ralph stop-hook leakage across sessions eliminated (PR [#1466](https://github.com/Yeachan-Heo/oh-my-codex/pull/1466))
+- Auto-nudge authorization leaks for read-only/planning flows (PR [#1434](https://github.com/Yeachan-Heo/oh-my-codex/pull/1434))
+- Notify hooks stay tracking live teams through coarse state drift (PR [#1428](https://github.com/Yeachan-Heo/oh-my-codex/pull/1428))
+- Launcher-backed MCP restart stalls now bounded (PR [#1408](https://github.com/Yeachan-Heo/oh-my-codex/pull/1408))
 
 ### Docs
-- docs: add autoresearch showcase hub with completed demos ([#884](https://github.com/Yeachan-Heo/oh-my-codex/pull/884))
+- Removed stale `prompts/` invocation guidance (PR [#1417](https://github.com/Yeachan-Heo/oh-my-codex/pull/1417))
 
-## Referenced issues
+## Verification
 
-[#888](https://github.com/Yeachan-Heo/oh-my-codex/issues/888), [#900](https://github.com/Yeachan-Heo/oh-my-codex/issues/900), [#908](https://github.com/Yeachan-Heo/oh-my-codex/issues/908), [#911](https://github.com/Yeachan-Heo/oh-my-codex/issues/911), [#917](https://github.com/Yeachan-Heo/oh-my-codex/issues/917)
+- `npm run build` ✅
+- `npm run lint` ✅
+- `npm test` ✅
+- `node --test dist/cli/__tests__/version-sync-contract.test.js` ✅
+- `npm run smoke:packed-install` ✅
 
 ## Contributors
 
 - [@Yeachan-Heo](https://github.com/Yeachan-Heo) (Bellman)
-- [@lifrary](https://github.com/lifrary) (SEUNGWOO LEE)
+- [@HaD0Yun](https://github.com/HaD0Yun)
 
-## Local release verification checklist
-
-Run before tagging / publishing:
-
-- `node scripts/check-version-sync.mjs --tag v0.10.3`
-- `npm run build`
-- `npm run check:no-unused`
-- `npm test`
-
-**Full Changelog**: [`v0.10.2...v0.10.3`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.10.2...v0.10.3)
+**Full Changelog**: [`v0.12.4...v0.12.5`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.12.4...v0.12.5)

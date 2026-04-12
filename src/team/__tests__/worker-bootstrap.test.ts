@@ -17,9 +17,13 @@ import {
   generateTaskAssignmentInbox,
   generateShutdownInbox,
   generateTriggerMessage,
+  buildTriggerDirective,
   generateMailboxTriggerMessage,
+  buildMailboxTriggerDirective,
   generateLeaderMailboxTriggerMessage,
+  buildLeaderMailboxTriggerDirective,
 } from "../worker-bootstrap.js";
+import { composeRoleInstructionsForRole } from "../../agents/native-config.js";
 import type { TeamTask } from "../state.js";
 
 function setMockCodexHome(codexHomePath: string): () => void {
@@ -443,6 +447,13 @@ describe("worker bootstrap", () => {
     assert.match(message, /next feasible task/i);
   });
 
+  it("buildTriggerDirective keeps human text separate from orchestration intent", () => {
+    const directive = buildTriggerDirective("worker-9", "team-path");
+    assert.equal(directive.intent, "followup-relaunch");
+    assert.match(directive.text, /\.omx\/state\/team\/team-path\/workers\/worker-9\/inbox\.md/);
+    assert.doesNotMatch(directive.text, /OMX_INTENT/);
+  });
+
   it("generateTriggerMessage uses provided state-root reference for worktree workers", () => {
     const message = generateTriggerMessage(
       "worker-9",
@@ -480,6 +491,13 @@ describe("worker bootstrap", () => {
     assert.match(message, /concrete progress/i);
     assert.match(message, /continue assigned work/i);
     assert.match(message, /next feasible task/i);
+  });
+
+  it("buildMailboxTriggerDirective keeps mailbox review intent out of display text", () => {
+    const directive = buildMailboxTriggerDirective("worker-2", "team-mail", 3);
+    assert.equal(directive.intent, "pending-mailbox-review");
+    assert.match(directive.text, /3 new message/);
+    assert.doesNotMatch(directive.text, /OMX_INTENT/);
   });
 
   it("generateMailboxTriggerMessage uses provided state-root reference for worktree workers", () => {
@@ -521,6 +539,13 @@ describe("worker bootstrap", () => {
     assert.match(message, /worker-2 sent a new message/);
     assert.match(message, /Review it and decide the next concrete step/);
     assert.doesNotMatch(message, /\bReply\b/i);
+  });
+
+  it("buildLeaderMailboxTriggerDirective records leader mailbox-review intent separately", () => {
+    const directive = buildLeaderMailboxTriggerDirective("team-mail", "worker-2");
+    assert.equal(directive.intent, "pending-mailbox-review");
+    assert.match(directive.text, /worker-2 sent a new message/);
+    assert.doesNotMatch(directive.text, /OMX_INTENT/);
   });
 
   it("generateLeaderMailboxTriggerMessage uses provided state-root reference for worktree leaders", () => {
@@ -671,6 +696,41 @@ describe("worker bootstrap", () => {
       assert.match(content, /<!-- OMX:TEAM:ROLE:START -->/);
       assert.match(content, /\*\*writer\*\* role/);
       assert.match(content, /<identity>Writer role prompt<\/identity>/);
+      assert.doesNotMatch(content, /exact gpt-5\.4-mini model/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("writeWorkerRoleInstructionsFile preserves precomposed mini guidance as wrapper-only content", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-worker-bootstrap-"));
+    try {
+      const overlay = generateWorkerOverlay("mini-role-team");
+      const basePath = await writeTeamWorkerInstructionsFile(
+        "mini-role-team",
+        cwd,
+        overlay,
+      );
+      const composedRoleInstructions = composeRoleInstructionsForRole(
+        "writer",
+        "---\ndescription: demo\n---\n\n<identity>You are Writer.</identity>",
+        "gpt-5.4-mini",
+      );
+      const outPath = await writeWorkerRoleInstructionsFile(
+        "mini-role-team",
+        "worker-2",
+        cwd,
+        basePath,
+        "writer",
+        composedRoleInstructions,
+      );
+
+      const content = await readFile(outPath, "utf8");
+      assert.match(content, /<identity>You are Writer\.<\/identity>/);
+      assert.match(content, /exact gpt-5\.4-mini model/);
+      assert.match(content, /strict execution order: inspect -> plan -> act -> verify/);
+      assert.equal((content.match(/<exact_model_guidance>/g) || []).length, 1);
+      assert.equal((content.match(/resolved_model: gpt-5\.4-mini/g) || []).length, 1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

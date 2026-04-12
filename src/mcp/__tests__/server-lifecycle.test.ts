@@ -14,11 +14,6 @@ const IDLE_ENTRYPOINTS = [
   { server: 'memory', file: 'memory-server.js' },
   { server: 'code_intel', file: 'code-intel-server.js' },
   { server: 'trace', file: 'trace-server.js' },
-  {
-    server: 'team',
-    file: 'team-server.js',
-    caveat: 'idle teardown only; request-time child-job semantics remain intentionally out of scope',
-  },
 ] as const;
 
 type EntryPoint = (typeof IDLE_ENTRYPOINTS)[number];
@@ -89,6 +84,10 @@ async function waitForExit(
   stderr: string[],
   stdout: string[],
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+
   try {
     const [code, signal] = (await Promise.race([
       once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>,

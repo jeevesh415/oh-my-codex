@@ -11,17 +11,34 @@
  * to an external hook handler.
  */
 
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { classifyTaskSize, isHeavyMode, type TaskSizeResult, type TaskSizeThresholds } from './task-size-detector.js';
 import { isApprovedExecutionFollowupShortcut, type FollowupMode } from '../team/followup-planner.js';
 import { isPlanningComplete, readPlanningArtifacts } from '../planning/artifacts.js';
 import { KEYWORD_TRIGGER_DEFINITIONS, compareKeywordMatches } from './keyword-registry.js';
+import {
+  SKILL_ACTIVE_STATE_FILE,
+  listActiveSkills,
+  writeSkillActiveStateCopies,
+  type SkillActiveEntry,
+} from '../state/skill-active.js';
+import {
+  buildWorkflowTransitionError,
+  evaluateWorkflowTransition,
+  isTrackedWorkflowMode,
+  type TrackedWorkflowMode,
+} from '../state/workflow-transition.js';
+import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
 
 export interface KeywordMatch {
   keyword: string;
   skill: string;
   priority: number;
+}
+
+function safeString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
 }
 
 export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing';
@@ -41,7 +58,7 @@ export interface SkillActiveState {
   active: boolean;
   skill: string;
   keyword: string;
-  phase: SkillActivePhase;
+  phase: string;
   activated_at: string;
   updated_at: string;
   source: 'keyword-detector';
@@ -49,6 +66,15 @@ export interface SkillActiveState {
   thread_id?: string;
   turn_id?: string;
   input_lock?: DeepInterviewInputLock;
+  active_skills?: SkillActiveEntry[];
+  initialized_mode?: string;
+  initialized_state_path?: string;
+  transition_error?: string;
+  transition_message?: string;
+  transition_messages?: string[];
+  requested_skills?: string[];
+  deferred_skills?: string[];
+  [key: string]: unknown;
 }
 
 export interface RecordSkillActivationInput {
@@ -60,9 +86,54 @@ export interface RecordSkillActivationInput {
   nowIso?: string;
 }
 
-export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
+export const DEEP_INTERVIEW_STATE_FILE = 'deep-interview-state.json';
 export const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'] as const;
 export const DEEP_INTERVIEW_INPUT_LOCK_MESSAGE = 'Deep interview is active; auto-approval shortcuts are blocked until the interview finishes.';
+
+type StatefulSkillMode = 'deep-interview' | 'autopilot' | 'ralph' | 'ralplan' | 'ultrawork' | 'ultraqa' | 'team';
+
+interface StatefulSkillSeedConfig {
+  mode: StatefulSkillMode;
+  initialPhase: string;
+  includeIteration?: boolean;
+  scope?: 'session' | 'root';
+}
+
+const PLANNING_LIKE_WORKFLOW_SKILLS = new Set<TrackedWorkflowMode>([
+  'deep-interview',
+  'ralplan',
+]);
+
+const EXECUTION_LIKE_WORKFLOW_SKILLS = new Set<TrackedWorkflowMode>([
+  'autopilot',
+  'ralph',
+  'team',
+  'ultrawork',
+  'ultraqa',
+]);
+
+const STATEFUL_SKILL_SEED_CONFIG: Record<StatefulSkillMode, StatefulSkillSeedConfig> = {
+  'deep-interview': { mode: 'deep-interview', initialPhase: 'intent-first' },
+  autopilot: { mode: 'autopilot', initialPhase: 'planning' },
+  ralph: { mode: 'ralph', initialPhase: 'starting', includeIteration: true },
+  ralplan: { mode: 'ralplan', initialPhase: 'planning' },
+  team: { mode: 'team', initialPhase: 'starting', scope: 'root' },
+  ultrawork: { mode: 'ultrawork', initialPhase: 'planning' },
+  ultraqa: { mode: 'ultraqa', initialPhase: 'planning' },
+};
+
+interface DeepInterviewModeState {
+  active: boolean;
+  mode: 'deep-interview';
+  current_phase: string;
+  started_at: string;
+  updated_at: string;
+  completed_at?: string;
+  session_id?: string;
+  thread_id?: string;
+  turn_id?: string;
+  input_lock?: DeepInterviewInputLock;
+}
 
 function createDeepInterviewInputLock(nowIso: string, previous?: DeepInterviewInputLock): DeepInterviewInputLock {
   return {
@@ -95,6 +166,168 @@ async function readExistingSkillState(statePath: string): Promise<SkillActiveSta
   } catch {
     return null;
   }
+}
+
+function buildActiveSkills(state: SkillActiveState): SkillActiveEntry[] | undefined {
+  if (!state.active) return undefined;
+  if (Array.isArray(state.active_skills) && state.active_skills.length > 0) {
+    return state.active_skills.filter((entry) => entry.active !== false);
+  }
+  return [{
+    skill: state.skill,
+    phase: state.phase,
+    active: true,
+    activated_at: state.activated_at,
+    updated_at: state.updated_at,
+    session_id: state.session_id,
+    thread_id: state.thread_id,
+    turn_id: state.turn_id,
+  }];
+}
+
+async function readExistingDeepInterviewState(statePath: string): Promise<DeepInterviewModeState | null> {
+  try {
+    const raw = await readFile(statePath, 'utf-8');
+    return JSON.parse(raw) as DeepInterviewModeState;
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonStateIfExists(path: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await readFile(path, 'utf-8');
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function persistDeepInterviewModeState(
+  stateDir: string,
+  nextSkill: SkillActiveState | null,
+  nowIso: string,
+  previousSkill: SkillActiveState | null,
+  input: RecordSkillActivationInput,
+): Promise<void> {
+  const statePath = join(stateDir, DEEP_INTERVIEW_STATE_FILE);
+  const previousModeState = await readExistingDeepInterviewState(statePath);
+
+  if (nextSkill?.skill === 'deep-interview' && nextSkill.active) {
+    const nextState: DeepInterviewModeState = {
+      active: true,
+      mode: 'deep-interview',
+      current_phase: previousModeState?.active ? previousModeState.current_phase || 'intent-first' : 'intent-first',
+      started_at: previousModeState?.active ? previousModeState.started_at || nowIso : nowIso,
+      updated_at: nowIso,
+      session_id: input.sessionId ?? previousModeState?.session_id,
+      thread_id: input.threadId ?? previousModeState?.thread_id,
+      turn_id: input.turnId ?? previousModeState?.turn_id,
+      ...(nextSkill.input_lock ? { input_lock: nextSkill.input_lock } : {}),
+    };
+    await writeFile(statePath, JSON.stringify(nextState, null, 2));
+    return;
+  }
+
+  const hadActiveDeepInterview = previousSkill?.skill === 'deep-interview' && previousSkill.active === true;
+  if (!previousModeState?.active && !hadActiveDeepInterview) return;
+
+  const releasedInputLock = nextSkill?.skill === 'deep-interview' ? nextSkill.input_lock : previousSkill?.input_lock;
+  const nextState: DeepInterviewModeState = {
+    active: false,
+    mode: 'deep-interview',
+    current_phase: 'completing',
+    started_at: previousModeState?.started_at || previousSkill?.activated_at || nowIso,
+    updated_at: nowIso,
+    completed_at: nowIso,
+    session_id: input.sessionId ?? previousModeState?.session_id ?? previousSkill?.session_id,
+    thread_id: input.threadId ?? previousModeState?.thread_id ?? previousSkill?.thread_id,
+    turn_id: input.turnId ?? previousModeState?.turn_id ?? previousSkill?.turn_id,
+    ...(releasedInputLock ? { input_lock: releasedInputLock } : {}),
+  };
+  await writeFile(statePath, JSON.stringify(nextState, null, 2));
+}
+
+function resolveSeedStateFilePath(
+  stateDir: string,
+  mode: StatefulSkillMode,
+  sessionId?: string,
+  scope: 'session' | 'root' = 'session',
+): {
+  absolutePath: string;
+  relativePath: string;
+} {
+  if (scope !== 'root' && sessionId?.trim()) {
+    return {
+      absolutePath: join(stateDir, 'sessions', sessionId, `${mode}-state.json`),
+      relativePath: `.omx/state/sessions/${sessionId}/${mode}-state.json`,
+    };
+  }
+
+  return {
+    absolutePath: join(stateDir, `${mode}-state.json`),
+    relativePath: `.omx/state/${mode}-state.json`,
+  };
+}
+
+async function persistStatefulSkillSeedState(
+  stateDir: string,
+  nextSkill: SkillActiveState,
+  nowIso: string,
+  previousSkill: SkillActiveState | null,
+): Promise<SkillActiveState> {
+  const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
+  if (!config) return nextSkill;
+
+  const { absolutePath, relativePath } = resolveSeedStateFilePath(
+    stateDir,
+    config.mode,
+    nextSkill.session_id,
+    config.scope,
+  );
+  const existingModeState = await readJsonStateIfExists(absolutePath);
+  const sameActiveSkill = previousSkill?.skill === nextSkill.skill && previousSkill.active;
+  const existingModeMatches = safeString(existingModeState?.mode).trim() === config.mode;
+  const existingPhase = safeString(existingModeState?.current_phase).trim();
+  const preserveExistingModeState = existingModeMatches
+    && existingPhase !== ''
+    && (
+      sameActiveSkill
+      || (config.mode === 'team' && existingModeState?.active === true)
+    );
+  const startedAt = previousSkill?.skill === nextSkill.skill && previousSkill.active
+    ? safeString(existingModeState?.started_at).trim() || previousSkill.activated_at || nowIso
+    : preserveExistingModeState
+      ? safeString(existingModeState?.started_at).trim() || nowIso
+    : nowIso;
+
+  const baseState: Record<string, unknown> = {
+    ...(preserveExistingModeState ? existingModeState : {}),
+    active: true,
+    mode: config.mode,
+    current_phase: preserveExistingModeState
+      ? existingPhase || config.initialPhase
+      : config.initialPhase,
+    started_at: startedAt,
+    updated_at: nowIso,
+    session_id: nextSkill.session_id || safeString(existingModeState?.session_id).trim() || undefined,
+    thread_id: nextSkill.thread_id || safeString(existingModeState?.thread_id).trim() || undefined,
+    turn_id: nextSkill.turn_id || safeString(existingModeState?.turn_id).trim() || undefined,
+  };
+
+  if (config.includeIteration) {
+    baseState.iteration = typeof existingModeState?.iteration === 'number' ? existingModeState.iteration : 0;
+    baseState.max_iterations = typeof existingModeState?.max_iterations === 'number' ? existingModeState.max_iterations : 50;
+  }
+
+  await mkdir(dirname(absolutePath), { recursive: true });
+  await writeFile(absolutePath, JSON.stringify(baseState, null, 2));
+
+  return {
+    ...nextSkill,
+    initialized_mode: config.mode,
+    initialized_state_path: relativePath,
+  };
 }
 
 function escapeRegex(text: string): string {
@@ -141,10 +374,16 @@ function hasExplicitPromptsInvocation(text: string): boolean {
   return /(?:^|\s)\/prompts:[\w.-]+(?=[\s.,!?;:]|$)/i.test(text);
 }
 
+function hasExplicitSkillLikeInvocation(text: string): boolean {
+  return /(?:^|[^\w])\$([a-z][a-z0-9-]*)\b/i.test(text);
+}
+
 function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
   const results: KeywordMatch[] = [];
   const regex = /(?:^|[^\w])\$([a-z][a-z0-9-]*)\b/gi;
   let match: RegExpExecArray | null;
+  let captureStarted = false;
+  let lastMatchEnd = -1;
 
   while ((match = regex.exec(text)) !== null) {
     const token = (match[1] ?? '').toLowerCase();
@@ -153,6 +392,16 @@ function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
     const normalizedSkill = token === 'swarm' ? 'team' : token;
     const registryEntry = KEYWORD_TRIGGER_DEFINITIONS.find((entry) => entry.skill.toLowerCase() === normalizedSkill);
     if (!registryEntry) continue;
+
+    const matchStart = match.index + match[0].lastIndexOf('$');
+    if (captureStarted) {
+      const between = text.slice(lastMatchEnd, matchStart);
+      if (!/^\s*$/.test(between)) break;
+    }
+
+    captureStarted = true;
+    lastMatchEnd = matchStart + token.length + 1;
+
     if (results.some((item) => item.skill === normalizedSkill)) continue;
 
     results.push({
@@ -180,6 +429,12 @@ export function detectKeywords(text: string): KeywordMatch[] {
   const explicit = extractExplicitSkillInvocations(text);
   if (hasExplicitPromptsInvocation(text) && explicit.length === 0) {
     return [];
+  }
+  if (explicit.length === 0 && hasExplicitSkillLikeInvocation(text)) {
+    return [];
+  }
+  if (explicit.length > 0) {
+    return explicit;
   }
 
   const implicit: KeywordMatch[] = [];
@@ -214,13 +469,38 @@ export function detectPrimaryKeyword(text: string): KeywordMatch | null {
   return matches.length > 0 ? matches[0] : null;
 }
 
+function resolveRequestedWorkflowSkills(requestedWorkflowSkills: TrackedWorkflowMode[]): {
+  requestedSkills: TrackedWorkflowMode[];
+  deferredSkills: TrackedWorkflowMode[];
+} {
+  const firstPlanningSkill = requestedWorkflowSkills.find((skill) => PLANNING_LIKE_WORKFLOW_SKILLS.has(skill));
+  const hasExecutionSkill = requestedWorkflowSkills.some((skill) => EXECUTION_LIKE_WORKFLOW_SKILLS.has(skill));
+
+  if (!firstPlanningSkill || !hasExecutionSkill) {
+    return {
+      requestedSkills: requestedWorkflowSkills,
+      deferredSkills: [],
+    };
+  }
+
+  return {
+    requestedSkills: [firstPlanningSkill],
+    deferredSkills: requestedWorkflowSkills.filter((skill) => skill !== firstPlanningSkill),
+  };
+}
+
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
   const match = detectPrimaryKeyword(input.text);
   if (!match) return null;
 
   const nowIso = input.nowIso ?? new Date().toISOString();
-  const statePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
-  const previous = await readExistingSkillState(statePath);
+  const rootStatePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
+  const sessionStatePath = input.sessionId
+    ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
+    : null;
+  const previousRoot = await readExistingSkillState(rootStatePath);
+  const previousSession = sessionStatePath ? await readExistingSkillState(sessionStatePath) : null;
+  const previous = previousSession ?? previousRoot;
   const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
   const matches = detectKeywords(input.text);
   const hasCancelIntent = matches.some((entry) => entry.skill === 'cancel');
@@ -238,11 +518,18 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       session_id: input.sessionId ?? previous?.session_id,
       thread_id: input.threadId ?? previous?.thread_id,
       turn_id: input.turnId ?? previous?.turn_id,
+      active_skills: [],
       ...(previous?.input_lock ? { input_lock: releaseDeepInterviewInputLock(previous.input_lock, nowIso, 'abort') } : {}),
     };
 
     try {
-      await writeFile(statePath, JSON.stringify(state, null, 2));
+      await writeSkillActiveStateCopies(
+        dirname(dirname(input.stateDir)),
+        state,
+        input.sessionId,
+        input.sessionId ? (previousRoot ?? state) : state,
+      );
+      await persistDeepInterviewModeState(input.stateDir, state, nowIso, previous, input);
     } catch (error) {
       console.warn('[omx] warning: failed to persist keyword activation state', error);
     }
@@ -252,10 +539,172 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 
   const sameSkill = previous?.active === true && previous.skill === match.skill;
   const sameKeyword = previous?.keyword?.toLowerCase() === match.keyword.toLowerCase();
+  const previousEntries = listActiveSkills(previous ?? {});
+  const previousWorkflowEntries = previousEntries.filter((entry) => (
+    isTrackedWorkflowMode(entry.skill)
+    && (
+      !input.sessionId
+      || !safeString(entry.session_id).trim()
+      || safeString(entry.session_id).trim() === safeString(input.sessionId).trim()
+    )
+  ));
 
   const deepInterviewInputLock = match.skill === 'deep-interview'
     ? createDeepInterviewInputLock(nowIso, previous?.input_lock)
     : releaseDeepInterviewInputLock(previous?.input_lock, nowIso);
+
+  if (isTrackedWorkflowMode(match.skill)) {
+    const workflowMatches = extractExplicitSkillInvocations(input.text)
+      .map((entry) => entry.skill)
+      .filter(isTrackedWorkflowMode);
+    const { requestedSkills: requestedWorkflowSkills, deferredSkills } = resolveRequestedWorkflowSkills(
+      workflowMatches.length > 0 ? workflowMatches : [match.skill],
+    );
+
+    let nextWorkflowEntries = previousWorkflowEntries.map((entry) => ({ ...entry }));
+    const transitionMessages: string[] = [];
+    for (const requestedMode of requestedWorkflowSkills) {
+      const decision = evaluateWorkflowTransition(
+        nextWorkflowEntries.map((entry) => entry.skill),
+        requestedMode,
+      );
+      if (!decision.allowed) {
+        return {
+          ...(previous ?? {}),
+          version: 1,
+          active: previous?.active ?? nextWorkflowEntries.length > 0,
+          skill: previous?.skill || match.skill,
+          keyword: previous?.keyword || match.keyword,
+          phase: previous?.phase || 'planning',
+          activated_at: previous?.activated_at || nowIso,
+          updated_at: nowIso,
+          source: 'keyword-detector',
+          session_id: input.sessionId ?? previous?.session_id,
+          thread_id: input.threadId ?? previous?.thread_id,
+          turn_id: input.turnId ?? previous?.turn_id,
+          active_skills: previousEntries,
+          ...(previous?.input_lock ? { input_lock: previous.input_lock } : {}),
+          transition_error: buildWorkflowTransitionError(
+            nextWorkflowEntries.map((entry) => entry.skill),
+            requestedMode,
+            'activate',
+          ),
+        };
+      }
+
+      if (decision.autoCompleteModes.length > 0) {
+        const transition = await reconcileWorkflowTransition(
+          dirname(dirname(input.stateDir)),
+          requestedMode,
+          {
+            action: 'activate',
+            sessionId: input.sessionId,
+            source: 'keyword-detector',
+            currentModes: nextWorkflowEntries.map((entry) => entry.skill),
+          },
+        );
+        if (transition.transitionMessage) {
+          transitionMessages.push(transition.transitionMessage);
+        }
+      }
+
+      const survivingSkills = new Set(decision.resultingModes);
+      nextWorkflowEntries = nextWorkflowEntries.filter((entry) => (
+        isTrackedWorkflowMode(entry.skill) && survivingSkills.has(entry.skill)
+      ));
+
+      const existingEntry = nextWorkflowEntries.find((entry) => entry.skill === requestedMode);
+      if (existingEntry) {
+        existingEntry.phase = requestedMode === match.skill ? 'planning' : existingEntry.phase;
+        existingEntry.active = true;
+        existingEntry.activated_at = requestedMode === match.skill
+          ? (sameSkill && sameKeyword ? existingEntry.activated_at || previous?.activated_at || nowIso : nowIso)
+          : existingEntry.activated_at;
+        existingEntry.updated_at = nowIso;
+        existingEntry.session_id = input.sessionId ?? existingEntry.session_id;
+        existingEntry.thread_id = input.threadId ?? existingEntry.thread_id;
+        existingEntry.turn_id = input.turnId ?? existingEntry.turn_id;
+        continue;
+      }
+
+      nextWorkflowEntries = [
+        ...nextWorkflowEntries,
+        {
+          skill: requestedMode,
+          phase: requestedMode === match.skill ? 'planning' : undefined,
+          active: true,
+          activated_at: requestedMode === match.skill && sameSkill && sameKeyword
+            ? previous?.activated_at
+            : nowIso,
+          updated_at: nowIso,
+          session_id: input.sessionId,
+          thread_id: input.threadId,
+          turn_id: input.turnId,
+        },
+      ];
+    }
+
+    const primaryEntry = nextWorkflowEntries.find((entry) => entry.skill === match.skill) ?? nextWorkflowEntries[0];
+    const primarySkill = primaryEntry?.skill || match.skill;
+    const workflowState: SkillActiveState = {
+      version: 1,
+      active: true,
+      skill: primarySkill,
+      keyword: primarySkill === match.skill ? match.keyword : `$${primarySkill}`,
+      phase: primaryEntry?.phase || 'planning',
+      activated_at: primaryEntry?.activated_at || nowIso,
+      updated_at: nowIso,
+      source: 'keyword-detector',
+      session_id: input.sessionId,
+      thread_id: input.threadId,
+      turn_id: input.turnId,
+      active_skills: nextWorkflowEntries,
+      ...(transitionMessages[0] ? { transition_message: transitionMessages[0] } : {}),
+      ...(transitionMessages.length > 0 ? { transition_messages: [...new Set(transitionMessages)] } : {}),
+      ...(requestedWorkflowSkills.length > 1 ? { requested_skills: requestedWorkflowSkills } : {}),
+      ...(deferredSkills.length > 0 ? { deferred_skills: deferredSkills } : {}),
+      ...(deepInterviewInputLock ? { input_lock: deepInterviewInputLock } : {}),
+    };
+
+    try {
+      let nextState: SkillActiveState = { ...workflowState };
+      for (const requestedEntry of nextWorkflowEntries) {
+        const seeded = await persistStatefulSkillSeedState(
+          input.stateDir,
+          {
+            ...workflowState,
+            skill: requestedEntry.skill,
+            keyword: requestedEntry.skill === workflowState.skill ? workflowState.keyword : `$${requestedEntry.skill}`,
+            phase: requestedEntry.phase || workflowState.phase,
+            activated_at: requestedEntry.activated_at || workflowState.activated_at,
+            updated_at: requestedEntry.updated_at || workflowState.updated_at,
+          },
+          nowIso,
+          previous,
+        );
+        if (requestedEntry.skill === workflowState.skill) {
+          nextState = {
+            ...workflowState,
+            initialized_mode: seeded.initialized_mode,
+            initialized_state_path: seeded.initialized_state_path,
+          };
+        }
+      }
+      nextState.active_skills = buildActiveSkills(nextState);
+      await writeSkillActiveStateCopies(
+        dirname(dirname(input.stateDir)),
+        nextState,
+        input.sessionId,
+        input.sessionId ? (previousRoot ?? nextState) : nextState,
+      );
+      await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
+      return nextState;
+    } catch (error) {
+      console.warn('[omx] warning: failed to persist keyword activation state', error);
+    }
+
+    return workflowState;
+  }
 
   const state: SkillActiveState = {
     version: 1,
@@ -269,11 +718,30 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     session_id: input.sessionId,
     thread_id: input.threadId,
     turn_id: input.turnId,
+    active_skills: [{
+      skill: match.skill,
+      phase: 'planning',
+      active: true,
+      activated_at: sameSkill && sameKeyword ? previous?.activated_at : nowIso,
+      updated_at: nowIso,
+      session_id: input.sessionId,
+      thread_id: input.threadId,
+      turn_id: input.turnId,
+    }],
     ...(deepInterviewInputLock ? { input_lock: deepInterviewInputLock } : {}),
   };
 
   try {
-    await writeFile(statePath, JSON.stringify(state, null, 2));
+    const nextState = await persistStatefulSkillSeedState(input.stateDir, state, nowIso, previous);
+    nextState.active_skills = buildActiveSkills(nextState);
+    await writeSkillActiveStateCopies(
+      dirname(dirname(input.stateDir)),
+      nextState,
+      input.sessionId,
+      input.sessionId ? (previousRoot ?? nextState) : nextState,
+    );
+    await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
+    return nextState;
   } catch (error) {
     console.warn('[omx] warning: failed to persist keyword activation state', error);
   }

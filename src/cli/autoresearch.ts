@@ -26,6 +26,7 @@ import {
 } from './autoresearch-intake.js';
 import { CODEX_BYPASS_FLAG, MADMAX_FLAG } from './constants.js';
 import { restoreStandaloneHudPane, enableMouseScrolling } from '../team/tmux-session.js';
+import { resolveOmxEntryPath } from '../utils/paths.js';
 
 export const AUTORESEARCH_HELP = `omx autoresearch - Launch OMX autoresearch with thin-supervisor parity semantics
 
@@ -156,7 +157,8 @@ function runAutoresearchTurn(worktreePath: string, instructionsFile: string, cod
     input: prompt,
     encoding: 'utf-8',
     env: process.env,
-  });
+      windowsHide: true,
+    });
 
   if (result.error) {
     throw result.error;
@@ -182,7 +184,8 @@ function resolveRepoRoot(cwd: string): string {
     cwd,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+      windowsHide: true,
+    }).trim();
 }
 
 export function parseAutoresearchArgs(args: readonly string[]): ParsedAutoresearchArgs {
@@ -277,12 +280,16 @@ async function runAutoresearchLoop(
 }
 
 function checkTmuxAvailable(): boolean {
-  const result = spawnSync('tmux', ['-V'], { stdio: 'pipe' });
+  const result = spawnSync('tmux', ['-V'], { stdio: 'pipe',
+      windowsHide: true,
+    });
   return result.status === 0;
 }
 
 function tmuxDisplay(target: string, format: string): string | null {
-  const result = spawnSync('tmux', ['display-message', '-p', '-t', target, format], { encoding: 'utf-8' });
+  const result = spawnSync('tmux', ['display-message', '-p', '-t', target, format], { encoding: 'utf-8',
+      windowsHide: true,
+    });
   if (result.error || result.status !== 0) return null;
   const value = (result.stdout || '').trim();
   return value || null;
@@ -323,7 +330,7 @@ function launchAutoresearchInSplitPane(args: {
   const currentCwd = tmuxDisplay(paneId, '#{pane_current_path}') || args.repoRoot;
   const existingHudPaneIds = listHudWatchPaneIdsInCurrentWindow(paneId);
 
-  const omxPath = process.argv[1];
+  const omxPath = resolveOmxEntryPath();
   if (!omxPath) return false;
   // Re-enter through the bare compatibility alias so the new pane executes immediately
   // instead of recursively taking the split-pane branch again.

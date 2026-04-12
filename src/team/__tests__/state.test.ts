@@ -1,6 +1,6 @@
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
+import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -42,12 +42,180 @@ import {
   markDispatchRequestDelivered,
   transitionDispatchRequest,
   readDispatchRequest,
+  readMonitorSnapshot,
   resolveDispatchLockTimeoutMs,
 } from '../state.js';
+import { normalizeDispatchRequest } from '../state/dispatch.js';
+
+const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+
+beforeEach(() => {
+  delete process.env.OMX_TEAM_STATE_ROOT;
+});
 
 afterEach(() => {
   resetWriteAtomicRenameForTests();
+  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
+  else delete process.env.OMX_TEAM_STATE_ROOT;
 });
+
+async function writeCompatRuntimeFixture(runtimePath: string, runtimeLogPath: string): Promise<void> {
+  await writeFile(
+    runtimePath,
+    `#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(runtimeLogPath)}, argv.join(' ') + '\\n');
+
+function argValue(prefix) {
+  const entry = argv.find((value) => value.startsWith(prefix));
+  return entry ? entry.slice(prefix.length) : null;
+}
+
+function stateDir() {
+  return argValue('--state-dir=') || process.cwd();
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  ensureDir(path.dirname(file));
+  fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\\n');
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+if (argv[0] === 'schema') {
+  process.stdout.write(JSON.stringify({
+    schema_version: 1,
+    commands: [
+      'acquire-authority',
+      'renew-authority',
+      'queue-dispatch',
+      'mark-notified',
+      'mark-delivered',
+      'mark-failed',
+      'request-replay',
+      'capture-snapshot',
+    ],
+    events: [],
+    transport: 'tmux',
+  }) + '\\n');
+  process.exit(0);
+}
+
+if (argv[0] !== 'exec') process.exit(1);
+
+const command = JSON.parse(argv[1] || '{}');
+const dir = stateDir();
+const dispatchPath = path.join(dir, 'dispatch.json');
+const mailboxPath = path.join(dir, 'mailbox.json');
+const dispatch = readJson(dispatchPath, { records: [] });
+const mailbox = readJson(mailboxPath, { records: [] });
+const timestamp = nowIso();
+
+switch (command.command) {
+  case 'QueueDispatch': {
+    dispatch.records.push({
+      request_id: command.request_id,
+      target: command.target,
+      status: 'pending',
+      created_at: timestamp,
+      notified_at: null,
+      delivered_at: null,
+      failed_at: null,
+      reason: null,
+      metadata: command.metadata ?? null,
+    });
+    writeJson(dispatchPath, dispatch);
+    process.stdout.write(JSON.stringify({ event: 'DispatchQueued', request_id: command.request_id, target: command.target, metadata: command.metadata ?? null }) + '\\n');
+    process.exit(0);
+  }
+  case 'MarkNotified': {
+    const record = dispatch.records.find((entry) => entry.request_id === command.request_id);
+    if (record) {
+      record.status = 'notified';
+      record.notified_at = timestamp;
+      record.reason = command.channel;
+      writeJson(dispatchPath, dispatch);
+    }
+    process.stdout.write(JSON.stringify({ event: 'DispatchNotified', request_id: command.request_id, channel: command.channel }) + '\\n');
+    process.exit(0);
+  }
+  case 'MarkDelivered': {
+    const record = dispatch.records.find((entry) => entry.request_id === command.request_id);
+    if (record) {
+      record.status = 'delivered';
+      record.delivered_at = timestamp;
+      writeJson(dispatchPath, dispatch);
+    }
+    process.stdout.write(JSON.stringify({ event: 'DispatchDelivered', request_id: command.request_id }) + '\\n');
+    process.exit(0);
+  }
+  case 'MarkFailed': {
+    const record = dispatch.records.find((entry) => entry.request_id === command.request_id);
+    if (record) {
+      record.status = 'failed';
+      record.failed_at = timestamp;
+      record.reason = command.reason;
+      writeJson(dispatchPath, dispatch);
+    }
+    process.stdout.write(JSON.stringify({ event: 'DispatchFailed', request_id: command.request_id, reason: command.reason }) + '\\n');
+    process.exit(0);
+  }
+  case 'CreateMailboxMessage': {
+    mailbox.records.push({
+      message_id: command.message_id,
+      from_worker: command.from_worker,
+      to_worker: command.to_worker,
+      body: command.body,
+      created_at: timestamp,
+      notified_at: null,
+      delivered_at: null,
+    });
+    writeJson(mailboxPath, mailbox);
+    process.stdout.write(JSON.stringify({ event: 'MailboxMessageCreated', message_id: command.message_id, from_worker: command.from_worker, to_worker: command.to_worker }) + '\\n');
+    process.exit(0);
+  }
+  case 'MarkMailboxNotified': {
+    const record = mailbox.records.find((entry) => entry.message_id === command.message_id);
+    if (record) {
+      record.notified_at = timestamp;
+      writeJson(mailboxPath, mailbox);
+    }
+    process.stdout.write(JSON.stringify({ event: 'MailboxNotified', message_id: command.message_id }) + '\\n');
+    process.exit(0);
+  }
+  case 'MarkMailboxDelivered': {
+    const record = mailbox.records.find((entry) => entry.message_id === command.message_id);
+    if (record) {
+      record.delivered_at = timestamp;
+      writeJson(mailboxPath, mailbox);
+    }
+    process.stdout.write(JSON.stringify({ event: 'MailboxDelivered', message_id: command.message_id }) + '\\n');
+    process.exit(0);
+  }
+  default:
+    process.exit(1);
+}
+`,
+  );
+  await chmod(runtimePath, 0o755);
+}
 
 describe('team state', () => {
   it('initTeamState creates correct directory structure and config.json', async () => {
@@ -90,7 +258,7 @@ describe('team state', () => {
     }
   });
 
-  it('initTeamState persists linked_ralph lifecycle profile when requested', async () => {
+  it('initTeamState persists the default lifecycle profile', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lifecycle-profile-'));
     try {
       const cfg = await initTeamState(
@@ -102,14 +270,14 @@ describe('team state', () => {
         DEFAULT_MAX_WORKERS,
         process.env,
         {},
-        'linked_ralph',
+        'default',
       );
 
-      assert.equal(cfg.lifecycle_profile, 'linked_ralph');
+      assert.equal(cfg.lifecycle_profile, 'default');
       const readCfg = await readTeamConfig('team-linked', cwd);
       const manifest = await readTeamManifestV2('team-linked', cwd);
-      assert.equal(readCfg?.lifecycle_profile, 'linked_ralph');
-      assert.equal(manifest?.lifecycle_profile, 'linked_ralph');
+      assert.equal(readCfg?.lifecycle_profile, 'default');
+      assert.equal(manifest?.lifecycle_profile, 'default');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -185,6 +353,60 @@ describe('team state', () => {
     }
   });
 
+  it('dispatch bridge queue uses the same request id as the TS store', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-bridge-sync-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    try {
+      await initTeamState('team-dispatch-sync', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(
+        join(fakeBinDir, 'omx-runtime'),
+        `#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "${runtimeLogPath}"
+if [[ "\${1:-}" == "schema" ]]; then
+  printf '{"schema_version":1,"commands":["acquire-authority","renew-authority","queue-dispatch","mark-notified","mark-delivered","mark-failed","request-replay","capture-snapshot"],"events":[],"transport":"tmux"}\n'
+  exit 0
+fi
+if [[ "\${1:-}" == "exec" ]]; then
+  printf '{"event":"DispatchQueued","request_id":"ok","target":"worker-1"}\n'
+  exit 0
+fi
+exit 1
+`,
+      );
+      await chmod(join(fakeBinDir, 'omx-runtime'), 0o755);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+
+      const queued = await enqueueDispatchRequest(
+        'team-dispatch-sync',
+        {
+          kind: 'inbox',
+          to_worker: 'worker-1',
+          trigger_message: 'ping',
+          intent: 'followup-relaunch',
+        },
+        cwd,
+      );
+
+      const runtimeLog = await readFile(runtimeLogPath, 'utf8');
+      const queueLine = runtimeLog.split('\n').find((line) => line.startsWith('exec {"command":"QueueDispatch"'));
+      assert.ok(queueLine, 'expected QueueDispatch bridge call');
+      const jsonStart = queueLine.indexOf('{');
+      const stateDirFlag = queueLine.lastIndexOf(' --state-dir=');
+      const jsonPayload = stateDirFlag > jsonStart ? queueLine.slice(jsonStart, stateDirFlag) : queueLine.slice(jsonStart);
+      const payload = JSON.parse(jsonPayload) as { request_id: string; metadata?: { intent?: string } };
+      assert.equal(payload.request_id, queued.request.request_id);
+      assert.equal(payload.metadata?.intent, 'followup-relaunch');
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('dispatch request store enqueues, dedupes, and transitions idempotently', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-store-'));
     try {
@@ -196,6 +418,7 @@ describe('team state', () => {
           to_worker: 'worker-1',
           message_id: 'msg-1',
           trigger_message: 'check mailbox',
+          intent: 'pending-mailbox-review',
         },
         cwd,
       );
@@ -223,12 +446,58 @@ describe('team state', () => {
       const listed = await listDispatchRequests('team-dispatch', cwd);
       assert.equal(listed.length, 1);
       assert.equal(listed[0]?.message_id, 'msg-1');
+      assert.equal(listed[0]?.intent, 'pending-mailbox-review');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('dispatch request store allows failed->failed reason patch and blocks failed->notified', async () => {
+  it('prefers bridge-authored dispatch records without mutating the legacy requests file', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-bridge-authority-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    try {
+      await initTeamState('team-dispatch-bridge-authority', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+
+      const legacyPath = join(cwd, '.omx', 'state', 'team', 'team-dispatch-bridge-authority', 'dispatch', 'requests.json');
+      const before = await readFile(legacyPath, 'utf8');
+      assert.equal(JSON.parse(before).length, 0);
+
+      const queued = await enqueueDispatchRequest(
+        'team-dispatch-bridge-authority',
+        {
+          kind: 'mailbox',
+          to_worker: 'worker-1',
+          message_id: 'bridge-msg-1',
+          trigger_message: 'check mailbox',
+        },
+        cwd,
+      );
+
+      const requests = await listDispatchRequests('team-dispatch-bridge-authority', cwd);
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0]?.request_id, queued.request.request_id);
+      assert.equal(requests[0]?.message_id, 'bridge-msg-1');
+
+      await markDispatchRequestNotified('team-dispatch-bridge-authority', queued.request.request_id, {}, cwd);
+      await markDispatchRequestDelivered('team-dispatch-bridge-authority', queued.request.request_id, {}, cwd);
+      const delivered = await readDispatchRequest('team-dispatch-bridge-authority', queued.request.request_id, cwd);
+      assert.equal(delivered?.status, 'delivered');
+
+      const after = await readFile(legacyPath, 'utf8');
+      assert.deepEqual(JSON.parse(after), [], 'bridge-success path should not rewrite legacy dispatch requests.json');
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('dispatch request store keeps failed requests failed while allowing reason patches', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-store-failed-'));
     try {
       await initTeamState('team-dispatch-failed', 't', 'executor', 1, cwd);
@@ -250,13 +519,13 @@ describe('team state', () => {
         cwd,
       );
 
-      const invalidNotified = await markDispatchRequestNotified(
+      const recovered = await markDispatchRequestNotified(
         'team-dispatch-failed',
         queued.request.request_id,
-        { last_reason: 'should_not_transition' },
+        { last_reason: 'fallback_confirmed:tmux_send_keys_sent', failed_at: undefined },
         cwd,
       );
-      assert.equal(invalidNotified, null);
+      assert.equal(recovered, null);
 
       const patched = await transitionDispatchRequest(
         'team-dispatch-failed',
@@ -270,6 +539,7 @@ describe('team state', () => {
       assert.equal(patched?.last_reason, 'fallback_confirmed_after_failed_receipt:tmux_send_keys_sent');
       const reread = await readDispatchRequest('team-dispatch-failed', queued.request.request_id, cwd);
       assert.equal(reread?.status, 'failed');
+      assert.equal(reread?.failed_at, patched?.failed_at);
       assert.equal(reread?.last_reason, 'fallback_confirmed_after_failed_receipt:tmux_send_keys_sent');
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -934,6 +1204,64 @@ describe('team state', () => {
     }
   });
 
+  it('uses bridge-authored mailbox records while shadowing legacy mailbox bodies for recovery', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-bridge-authority-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    try {
+      await initTeamState('team-mailbox-bridge-authority', 't', 'executor', 2, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+
+      const legacyPath = join(cwd, '.omx', 'state', 'team', 'team-mailbox-bridge-authority', 'mailbox', 'worker-2.json');
+      assert.equal(existsSync(legacyPath), false);
+
+      const message = await sendDirectMessage('team-mailbox-bridge-authority', 'worker-1', 'worker-2', 'hello', cwd);
+      assert.equal(message.to_worker, 'worker-2');
+      await markMessageNotified('team-mailbox-bridge-authority', 'worker-2', message.message_id, cwd);
+      await markMessageDelivered('team-mailbox-bridge-authority', 'worker-2', message.message_id, cwd);
+
+      const messages = await listMailboxMessages('team-mailbox-bridge-authority', 'worker-2', cwd);
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0]?.message_id, message.message_id);
+      assert.equal(messages[0]?.body, 'hello');
+      assert.equal(typeof messages[0]?.notified_at, 'string');
+      assert.equal(typeof messages[0]?.delivered_at, 'string');
+
+      assert.equal(existsSync(legacyPath), true, 'bridge-success path should shadow-write legacy mailbox JSON for body recovery');
+      const after = JSON.parse(await readFile(legacyPath, 'utf8')) as { messages: Array<{ message_id: string; body: string }> };
+      assert.equal(after.messages.length, 1);
+      assert.equal(after.messages[0]?.message_id, message.message_id);
+      assert.equal(after.messages[0]?.body, 'hello');
+
+      const compatPath = join(cwd, '.omx', 'state', 'mailbox.json');
+      const compat = JSON.parse(await readFile(compatPath, 'utf8')) as { records: Array<{ message_id: string; body: string }> };
+      const compatRecord = compat.records.find((entry) => entry.message_id === message.message_id);
+      assert.ok(compatRecord);
+
+      const runtimeLogBefore = await readFile(runtimeLogPath, 'utf8');
+      const deliveredCallsBefore = runtimeLogBefore.split('MarkMailboxDelivered').length - 1;
+      const deliveredAgain = await markMessageDelivered('team-mailbox-bridge-authority', 'worker-2', message.message_id, cwd);
+      assert.equal(deliveredAgain, true, 'already-delivered bridge message should be treated as delivered');
+      const runtimeLogAfter = await readFile(runtimeLogPath, 'utf8');
+      const deliveredCallsAfter = runtimeLogAfter.split('MarkMailboxDelivered').length - 1;
+      assert.equal(deliveredCallsAfter, deliveredCallsBefore, 'idempotent delivered calls should not invoke bridge a second time');
+
+      compatRecord!.body = '';
+      await writeFile(compatPath, JSON.stringify(compat, null, 2));
+
+      const recovered = await listMailboxMessages('team-mailbox-bridge-authority', 'worker-2', cwd);
+      assert.equal(recovered.length, 1);
+      assert.equal(recovered[0]?.body, 'hello', 'legacy shadow mailbox should backfill blank compat bodies');
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('sendDirectMessage recreates mailbox directory when missing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-'));
     try {
@@ -1014,6 +1342,31 @@ describe('team state', () => {
       for (const id of expectedIds) {
         assert.equal(actualIds.has(id), true);
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('sendDirectMessage reuses identical undelivered messages instead of appending duplicates', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-'));
+    try {
+      await initTeamState('team-msg-dedupe', 't', 'executor', 2, cwd);
+      const first = await sendDirectMessage('team-msg-dedupe', 'worker-1', 'leader-fixed', 'same-body', cwd);
+      const second = await sendDirectMessage('team-msg-dedupe', 'worker-1', 'leader-fixed', 'same-body', cwd);
+
+      assert.equal(second.message_id, first.message_id);
+
+      const mailbox = await listMailboxMessages('team-msg-dedupe', 'leader-fixed', cwd);
+      assert.equal(mailbox.length, 1);
+      assert.equal(mailbox[0]?.body, 'same-body');
+
+      const delivered = await markMessageDelivered('team-msg-dedupe', 'leader-fixed', first.message_id, cwd);
+      assert.equal(delivered, true);
+
+      const third = await sendDirectMessage('team-msg-dedupe', 'worker-1', 'leader-fixed', 'same-body', cwd);
+      assert.notEqual(third.message_id, first.message_id);
+      const mailboxAfter = await listMailboxMessages('team-msg-dedupe', 'leader-fixed', cwd);
+      assert.equal(mailboxAfter.length, 2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1119,6 +1472,38 @@ describe('team state', () => {
 
       const t2 = await createTask('team-legacy', { subject: 'b', description: 'd', status: 'pending' }, cwd);
       assert.equal(t2.id, '2');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('createTask does not overwrite existing tasks when manifest/config next_task_id lags disk', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      await initTeamState('team-stale-next-id', 't', 'executor', 1, cwd);
+
+      const first = await createTask('team-stale-next-id', { subject: 'first', description: 'd', status: 'pending' }, cwd);
+      assert.equal(first.id, '1');
+
+      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-stale-next-id');
+      const configPath = join(teamRoot, 'config.json');
+      const manifestPath = join(teamRoot, 'manifest.v2.json');
+
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      config.next_task_id = 1;
+      await writeAtomic(configPath, JSON.stringify(config, null, 2));
+
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      manifest.next_task_id = 1;
+      await writeAtomic(manifestPath, JSON.stringify(manifest, null, 2));
+
+      const second = await createTask('team-stale-next-id', { subject: 'second', description: 'd', status: 'pending' }, cwd);
+      assert.equal(second.id, '2');
+
+      const firstTask = JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-1.json'), 'utf8')) as { subject?: string };
+      const secondTask = JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-2.json'), 'utf8')) as { subject?: string };
+      assert.equal(firstTask.subject, 'first');
+      assert.equal(secondTask.subject, 'second');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1636,6 +2021,99 @@ describe('team state', () => {
         }
         await rm(lockDir, { recursive: true, force: true });
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('treats dispatch status as authoritative over incompatible timestamps', () => {
+    const pending = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'pending',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(pending?.status, 'pending');
+    assert.equal(pending?.notified_at, undefined);
+    assert.equal(pending?.delivered_at, undefined);
+    assert.equal(pending?.failed_at, undefined);
+
+    const notified = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'notified',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(notified?.status, 'notified');
+    assert.equal(notified?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(notified?.delivered_at, undefined);
+    assert.equal(notified?.failed_at, undefined);
+
+    const delivered = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'delivered',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(delivered?.status, 'delivered');
+    assert.equal(delivered?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(delivered?.delivered_at, '2026-04-04T00:01:00.000Z');
+    assert.equal(delivered?.failed_at, undefined);
+
+    const failed = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'failed',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(failed?.status, 'failed');
+    assert.equal(failed?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(failed?.delivered_at, undefined);
+    assert.equal(failed?.failed_at, '2026-04-04T00:02:00.000Z');
+  });
+
+  it('sanitizes persisted integration snapshot statuses to the contract', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-monitor-contract-'));
+    try {
+      await initTeamState('team-monitor-contract', 't', 'executor', 1, cwd);
+      const monitorPath = join(cwd, '.omx', 'state', 'team', 'team-monitor-contract', 'monitor-snapshot.json');
+      await writeFile(monitorPath, JSON.stringify({
+        taskStatusById: {},
+        workerAliveByName: {},
+        workerStateByName: {},
+        workerTurnCountByName: {},
+        workerTaskIdByName: {},
+        mailboxNotifiedByMessageId: {},
+        completedEventTaskIds: {},
+        integrationByWorker: {
+          'worker-1': {
+            status: 'integrated',
+            last_integrated_head: 'abc123',
+          },
+          'worker-2': {
+            status: 'mystery_state',
+            last_integrated_head: 'def456',
+          },
+        },
+      }, null, 2));
+
+      const snapshot = await readMonitorSnapshot('team-monitor-contract', cwd);
+      assert.equal(snapshot?.integrationByWorker?.['worker-1']?.status, 'integrated');
+      assert.equal(snapshot?.integrationByWorker?.['worker-1']?.last_integrated_head, 'abc123');
+      assert.equal(snapshot?.integrationByWorker?.['worker-2']?.status, undefined);
+      assert.equal(snapshot?.integrationByWorker?.['worker-2']?.last_integrated_head, 'def456');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

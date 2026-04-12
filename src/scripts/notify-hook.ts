@@ -12,7 +12,6 @@
  *   process-runner.js  – child-process helper
  *   log.js             – structured event logging
  *   auto-nudge.js      – stall-pattern detection and auto-nudge
- *   linked-sync.js     – linked ralph/team terminal sync
  *   tmux-injection.js  – tmux prompt injection
  *   team-dispatch.js   – durable team dispatch queue consumer
  *   team-leader-nudge.js – leader mailbox nudge
@@ -21,7 +20,7 @@
 
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -30,7 +29,9 @@ import {
   normalizeInputMessages,
 } from './notify-hook/payload-parser.js';
 import {
-  readJsonIfExists,
+  getScopedStatePath,
+  readCurrentSessionId,
+  readScopedJsonIfExists,
   getScopedStateDirsForCurrentSession,
   normalizeNotifyState,
   pruneRecentTurns,
@@ -38,9 +39,12 @@ import {
 } from './notify-hook/state-io.js';
 import { isLeaderStale, resolveLeaderStalenessThresholdMs, maybeNudgeTeamLeader } from './notify-hook/team-leader-nudge.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
-import { syncLinkedRalphOnTeamTerminal } from './notify-hook/linked-sync.js';
 import { handleTmuxInjection } from './notify-hook/tmux-injection.js';
-import { maybeAutoNudge, resolveNudgePaneTarget } from './notify-hook/auto-nudge.js';
+import { maybeAutoNudge, resolveNudgePaneTarget, isDeepInterviewStateActive } from './notify-hook/auto-nudge.js';
+import { isManagedOmxSession } from './notify-hook/managed-tmux.js';
+import { logNotifyHookEvent } from './notify-hook/log.js';
+import { reconcileRalphSessionResume } from './notify-hook/ralph-session-resume.js';
+import { sendPaneInput } from './notify-hook/team-tmux-guard.js';
 import {
   buildOperationalContext,
   deriveAssistantSignalEvents,
@@ -70,6 +74,84 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'fixing',
 ]);
 
+const IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH = 240;
+
+function summarizeIdleNotificationMessage(message: unknown): string {
+  const source = safeString(message)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const preferred = source.at(-1) || '';
+  const normalized = preferred.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH
+    ? `${normalized.slice(0, IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH - 1)}…`
+    : normalized;
+}
+
+function classifyIdleNotificationPhase(message: unknown): 'idle' | 'progress' | 'finished' | 'failed' {
+  const lower = safeString(message).toLowerCase();
+  if (!lower) return 'idle';
+
+  if (/(error|failed|exception|invalid|timed out|timeout)/i.test(lower)) {
+    return 'failed';
+  }
+
+  if ([
+    'all tests pass',
+    'build succeeded',
+    'completed',
+    'complete',
+    'done',
+    'final summary',
+    'summary',
+  ].some((pattern) => lower.includes(pattern))) {
+    return 'finished';
+  }
+
+  if ([
+    'verify',
+    'verified',
+    'verification',
+    'review',
+    'reviewed',
+    'diagnostic',
+    'typecheck',
+    'test',
+    'implement',
+    'implemented',
+    'apply patch',
+    'change',
+    'fix',
+    'update',
+    'refactor',
+    'resume',
+    'resumed',
+    'progress',
+    'continue',
+    'continued',
+  ].some((pattern) => lower.includes(pattern))) {
+    return 'progress';
+  }
+
+  return 'idle';
+}
+
+function buildIdleNotificationFingerprint(payload: Record<string, unknown>): string {
+  const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
+  const summary = summarizeIdleNotificationMessage(lastAssistantMessage);
+  const phase = classifyIdleNotificationPhase(lastAssistantMessage);
+  return JSON.stringify({
+    phase,
+    ...(summary ? { summary } : {}),
+  });
+}
+
+function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
+  const type = safeString(payload.type || '').trim().toLowerCase();
+  return type === '' || type === 'agent-turn-complete' || type === 'turn-complete';
+}
+
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -85,6 +167,10 @@ async function main() {
 
   const cwd = payload.cwd || payload['cwd'] || process.cwd();
   const payloadSessionId = safeString(payload.session_id || payload['session-id'] || '');
+  const payloadThreadId = safeString(payload['thread-id'] || payload.thread_id || '');
+  const inputMessages = normalizeInputMessages(payload);
+  const latestUserInput = safeString(inputMessages.length > 0 ? inputMessages[inputMessages.length - 1] : '');
+  const isTurnComplete = isTurnCompletePayload(payload);
 
   // Team worker detection via environment variable
   const teamWorkerEnv = process.env.OMX_TEAM_WORKER; // e.g., "fix-ts/worker-1"
@@ -96,10 +182,13 @@ async function main() {
     : join(cwd, '.omx', 'state');
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
+  let currentOmxSessionId = '';
+  const getEffectiveSessionId = () => currentOmxSessionId || payloadSessionId;
 
   // Ensure directories exist
   await mkdir(logsDir, { recursive: true }).catch(() => {});
   await mkdir(stateDir, { recursive: true }).catch(() => {});
+  currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
 
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
@@ -110,14 +199,18 @@ async function main() {
       const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
       const eventType = safeString(payload.type || 'agent-turn-complete');
       const key = `${threadId || 'no-thread'}|${turnId}|${eventType}`;
-      const dedupeStatePath = join(stateDir, 'notify-hook-state.json');
-      const dedupeState = normalizeNotifyState(await readJsonIfExists(dedupeStatePath, null));
+      const dedupeSessionId = getEffectiveSessionId();
+      const dedupeStatePath = await getScopedStatePath(stateDir, 'notify-hook-state.json', dedupeSessionId);
+      const dedupeState = normalizeNotifyState(
+        await readScopedJsonIfExists(stateDir, 'notify-hook-state.json', dedupeSessionId, null),
+      );
       dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
       if (dedupeState.recent_turns[key]) {
         process.exit(0);
       }
       dedupeState.recent_turns[key] = now;
       dedupeState.last_event_at = new Date().toISOString();
+      await mkdir(dirname(dedupeStatePath), { recursive: true }).catch(() => {});
       await writeFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
     }
   } catch {
@@ -129,10 +222,10 @@ async function main() {
     try {
       const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
       const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
-      if (payloadSessionId && threadId) {
+      if (getEffectiveSessionId() && threadId) {
         const { recordSubagentTurnForSession } = await import('../subagents/tracker.js');
         await recordSubagentTurnForSession(cwd, {
-          sessionId: payloadSessionId,
+          sessionId: getEffectiveSessionId(),
           threadId,
           ...(turnId ? { turnId } : {}),
           timestamp: new Date().toISOString(),
@@ -160,11 +253,49 @@ async function main() {
   const logFile = join(logsDir, `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
   await appendFile(logFile, JSON.stringify(logEntry) + '\n').catch(() => {});
 
+  if (!isTurnComplete) {
+    return;
+  }
+
+  // Reconcile Ralph ownership for same-Codex-session continuation before
+  // lifecycle counters or injection read the active scope.
+  if (!isTeamWorker) {
+    try {
+      const resumeResult = await reconcileRalphSessionResume({
+        stateDir,
+        payloadSessionId,
+        payloadThreadId,
+      });
+      currentOmxSessionId = resumeResult.currentOmxSessionId;
+      if (resumeResult.resumed || resumeResult.updatedCurrentOwner) {
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          type: 'ralph_session_resume',
+          reason: resumeResult.reason,
+          current_omx_session_id: resumeResult.currentOmxSessionId || null,
+          payload_codex_session_id: payloadSessionId || null,
+          source_path: resumeResult.sourcePath || null,
+          target_path: resumeResult.targetPath || null,
+          owner_updated: resumeResult.updatedCurrentOwner,
+          resumed: resumeResult.resumed,
+        });
+      }
+    } catch (error) {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'ralph_session_resume_failure',
+        payload_codex_session_id: payloadSessionId || null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   // 2. Update active mode state (increment iteration)
   // GUARD: Skip when running inside a team worker to prevent state corruption
   if (!isTeamWorker) {
     try {
-      const scopedDirs = await getScopedStateDirsForCurrentSession(stateDir, payloadSessionId);
+      const scopedDirs = await getScopedStateDirsForCurrentSession(stateDir);
       for (const scopedDir of scopedDirs) {
         const stateFiles = await readdir(scopedDir).catch(() => []);
         for (const f of stateFiles) {
@@ -218,10 +349,6 @@ async function main() {
     }
   }
 
-  // If linked team reaches terminal state, mark linked ralph terminal/inactive too.
-  if (!isTeamWorker) {
-    await syncLinkedRalphOnTeamTerminal(stateDir, new Date().toISOString(), payloadSessionId);
-  }
 
   // 3. Track subagent metrics (lead session only)
   if (!isTeamWorker) {
@@ -298,16 +425,20 @@ async function main() {
 
   // 4. Write HUD state summary for `omx hud` (lead session only)
   if (!isTeamWorker) {
-    const hudStatePath = join(stateDir, 'hud-state.json');
     try {
-      let hudState = { last_turn_at: '', turn_count: 0 };
-      if (existsSync(hudStatePath)) {
-        hudState = JSON.parse(await readFile(hudStatePath, 'utf-8'));
-      }
-      hudState.last_turn_at = new Date().toISOString();
+      const scopedSessionId = getEffectiveSessionId();
+      const hudStatePath = await getScopedStatePath(stateDir, 'hud-state.json', scopedSessionId);
+      let hudState = await readScopedJsonIfExists(stateDir, 'hud-state.json', scopedSessionId, {
+        last_turn_at: '',
+        turn_count: 0,
+      });
+      const nowIso = new Date().toISOString();
+      hudState.last_turn_at = nowIso;
+      (hudState as any).last_progress_at = nowIso;
       hudState.turn_count = (hudState.turn_count || 0) + 1;
       (hudState as any).last_agent_output = (payload['last-assistant-message'] || payload.last_assistant_message || '')
         .slice(0, 100);
+      await mkdir(dirname(hudStatePath), { recursive: true }).catch(() => {});
       await writeFile(hudStatePath, JSON.stringify(hudState, null, 2));
     } catch {
       // Non-critical
@@ -326,8 +457,26 @@ async function main() {
     }
   }
 
+  // 4.45. Skill activation tracking: update skill-active-state.json before any nudge logic.
+  try {
+    const { recordSkillActivation } = await import('../hooks/keyword-detector.js');
+    if (latestUserInput) {
+        await recordSkillActivation({
+          stateDir,
+          text: latestUserInput,
+          sessionId: getEffectiveSessionId(),
+          threadId: payloadThreadId,
+          turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+        });
+    }
+  } catch {
+    // Non-fatal: keyword detector module may not be built yet
+  }
+
+  const deepInterviewStateActive = await isDeepInterviewStateActive(stateDir, getEffectiveSessionId());
+
   // 4.55. Notify leader when individual worker transitions to idle (worker session only)
-  if (isTeamWorker && parsedTeamWorker) {
+  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive) {
     try {
       await maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, parsedTeamWorker });
     } catch {
@@ -336,7 +485,7 @@ async function main() {
   }
 
   // 4.6. Notify leader when all workers are idle (worker session only)
-  if (isTeamWorker && parsedTeamWorker) {
+  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive) {
     try {
       await maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, parsedTeamWorker });
     } catch {
@@ -364,7 +513,7 @@ async function main() {
   }
 
   // 6. Team leader nudge (lead session only): remind the leader to check teammate/mailbox state.
-  if (!isTeamWorker) {
+  if (!isTeamWorker && !deepInterviewStateActive) {
     try {
       await maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputedLeaderStale });
     } catch {
@@ -376,7 +525,7 @@ async function main() {
   try {
     const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-    const sessionIdForHooks = safeString(payload.session_id || payload['session-id'] || '');
+    const sessionIdForHooks = getEffectiveSessionId();
     const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
     const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
     const modeForHooks = safeString(payload.mode || '');
@@ -386,6 +535,8 @@ async function main() {
       type: safeString(payload.type || 'agent-turn-complete'),
       input_messages: normalizeInputMessages(payload),
       output_preview: outputPreview,
+      native_session_id: payloadSessionId || null,
+      omx_session_id: sessionIdForHooks || null,
       ...readRepositoryMetadata(cwd),
       session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
       project_path: cwd,
@@ -407,6 +558,8 @@ async function main() {
         status: signal.normalized_event,
         errorSummary: signal.error_summary,
         extra: {
+          native_session_id: payloadSessionId || null,
+          omx_session_id: sessionIdForHooks || null,
           source_event: safeString(payload.type || 'agent-turn-complete'),
         },
       }), {
@@ -427,45 +580,64 @@ async function main() {
   if (!isTeamWorker) {
     try {
       const { notifyLifecycle } = await import('../notifications/index.js');
-      const { shouldSendIdleNotification, recordIdleNotificationSent } = await import('../notifications/idle-cooldown.js');
+      const {
+        shouldSendIdleNotification,
+        recordIdleNotificationSent,
+        shouldSendSessionIdleHookEvent,
+        recordSessionIdleHookEventSent,
+      } = await import('../notifications/idle-cooldown.js');
       const sessionJsonPath = join(stateDir, 'session.json');
+      const idleFingerprint = buildIdleNotificationFingerprint(payload);
       let notifySessionId = '';
       try {
         const sessionData = JSON.parse(await readFile(sessionJsonPath, 'utf-8'));
         notifySessionId = safeString(sessionData && sessionData.session_id ? sessionData.session_id : '');
       } catch { /* no session file */ }
 
-      if (notifySessionId && shouldSendIdleNotification(stateDir, notifySessionId)) {
-        const idleResult = await notifyLifecycle('session-idle', {
-          sessionId: notifySessionId,
-          projectPath: cwd,
-        });
-        if (idleResult && idleResult.anySuccess) {
-          recordIdleNotificationSent(stateDir, notifySessionId);
-        }
-        try {
-          const { buildNativeHookEvent } = await import('../hooks/extensibility/events.js');
-          const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-          const event = buildNativeHookEvent('session-idle', {
-            ...buildOperationalContext({
-              cwd,
-              normalizedEvent: 'blocked',
-              sessionId: notifySessionId,
-              status: 'blocked',
-              extra: {
-                project_path: cwd,
-                reason: 'post_turn_idle_notification',
-              },
-            }),
-          }, {
-            session_id: notifySessionId,
-            thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
-            turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
-            mode: safeString(payload.mode || ''),
+      const shouldNotifyLifecycle = notifySessionId
+        && shouldSendIdleNotification(stateDir, notifySessionId, idleFingerprint);
+      const shouldDispatchSessionIdleHookEvent = notifySessionId
+        && shouldSendSessionIdleHookEvent(stateDir, notifySessionId, idleFingerprint);
+
+      if (shouldNotifyLifecycle || shouldDispatchSessionIdleHookEvent) {
+        if (shouldNotifyLifecycle) {
+          const idleResult = await notifyLifecycle('session-idle', {
+            sessionId: notifySessionId,
+            projectPath: cwd,
           });
-          await dispatchHookEvent(event, { cwd });
-        } catch {
-          // Non-fatal
+          if (idleResult && idleResult.anySuccess) {
+            recordIdleNotificationSent(stateDir, notifySessionId, idleFingerprint);
+          }
+        }
+
+        if (shouldDispatchSessionIdleHookEvent) {
+          try {
+            const { buildNativeHookEvent } = await import('../hooks/extensibility/events.js');
+            const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
+            const event = buildNativeHookEvent('session-idle', {
+              ...buildOperationalContext({
+                cwd,
+                normalizedEvent: 'blocked',
+                sessionId: notifySessionId,
+                status: 'blocked',
+                extra: {
+                  project_path: cwd,
+                  reason: 'post_turn_idle_notification',
+                },
+              }),
+            }, {
+              session_id: notifySessionId,
+              thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+              turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
+              mode: safeString(payload.mode || ''),
+            });
+            const hookDispatchResult = await dispatchHookEvent(event, { cwd });
+            if (hookDispatchResult.results.some((result) => result.ok)) {
+              recordSessionIdleHookEventSent(stateDir, notifySessionId, idleFingerprint);
+            }
+          } catch {
+            // Non-fatal
+          }
         }
       }
     } catch {
@@ -473,30 +645,14 @@ async function main() {
     }
   }
 
-  // 8.5. Skill activation tracking: update skill-active-state.json when a keyword is detected.
-  try {
-    const { recordSkillActivation } = await import('../hooks/keyword-detector.js');
-    const inputMessages = normalizeInputMessages(payload);
-    const latestUserInput = safeString(inputMessages.length > 0 ? inputMessages[inputMessages.length - 1] : '');
-    if (latestUserInput) {
-      await recordSkillActivation({
-        stateDir,
-        text: latestUserInput,
-        sessionId: payloadSessionId,
-        threadId: safeString(payload['thread-id'] || payload.thread_id || ''),
-        turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
-      });
-    }
-  } catch {
-    // Non-fatal: keyword detector module may not be built yet
-  }
-
   // 9. Auto-nudge: detect Codex stall patterns and automatically send a continuation prompt.
   //    Works for both leader and worker contexts.
-  try {
-    await maybeAutoNudge({ cwd, stateDir, logsDir, payload });
-  } catch {
-    // Non-critical
+  if (!deepInterviewStateActive) {
+    try {
+      await maybeAutoNudge({ cwd, stateDir, logsDir, payload });
+    } catch {
+      // Non-critical
+    }
   }
 
   // 10.5. Visual verdict persistence (non-fatal, observable – issue #421)
@@ -508,7 +664,7 @@ async function main() {
         payload,
         stateDir,
         logsDir,
-        sessionId: payloadSessionId,
+        sessionId: getEffectiveSessionId(),
         turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
       });
     } catch (err) {
@@ -518,7 +674,7 @@ async function main() {
         level: 'warn',
         type: 'visual_verdict_import_failure',
         error: (err as any)?.message || String(err),
-        session_id: payloadSessionId,
+        session_id: getEffectiveSessionId(),
         turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
       });
       const warnFile = join(logsDir, `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
@@ -533,23 +689,36 @@ async function main() {
       const { processCodeSimplifier } = await import('../hooks/code-simplifier/index.js');
       const csResult = processCodeSimplifier(cwd, stateDir);
       if (csResult.triggered) {
-        const csPaneId = await resolveNudgePaneTarget(stateDir);
-        if (csPaneId) {
-          const csText = `${csResult.message} ${DEFAULT_MARKER}`;
-          const { runProcess } = await import('./notify-hook/process-runner.js');
-          await runProcess('tmux', ['send-keys', '-t', csPaneId, '-l', csText], 3000);
-          await new Promise(r => setTimeout(r, 100));
-          await runProcess('tmux', ['send-keys', '-t', csPaneId, 'C-m'], 3000);
-          await new Promise(r => setTimeout(r, 100));
-          await runProcess('tmux', ['send-keys', '-t', csPaneId, 'C-m'], 3000);
-
+        const managedSession = await isManagedOmxSession(cwd, payload, { allowTeamWorker: false });
+        if (!managedSession) {
           const { logTmuxHookEvent } = await import('./notify-hook/log.js');
           await logTmuxHookEvent(logsDir, {
             timestamp: new Date().toISOString(),
-            type: 'code_simplifier_triggered',
-            pane_id: csPaneId,
-            file_count: csResult.message.split('\n').filter(l => l.trimStart().startsWith('- ')).length,
+            type: 'code_simplifier_skipped',
+            reason: 'unmanaged_session',
           });
+        } else {
+          const csPaneId = await resolveNudgePaneTarget(stateDir, cwd, payload);
+          if (csPaneId) {
+            const csText = `${csResult.message} ${DEFAULT_MARKER}`;
+            const sendResult = await sendPaneInput({
+              paneTarget: csPaneId,
+              prompt: csText,
+              submitKeyPresses: 2,
+              submitDelayMs: 100,
+            });
+            if (!sendResult.ok) {
+              throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+            }
+
+            const { logTmuxHookEvent } = await import('./notify-hook/log.js');
+            await logTmuxHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              type: 'code_simplifier_triggered',
+              pane_id: csPaneId,
+              file_count: csResult.message.split('\n').filter(l => l.trimStart().startsWith('- ')).length,
+            });
+          }
         }
       }
     } catch {
@@ -558,4 +727,8 @@ async function main() {
   }
 }
 
-main().catch(() => process.exit(0));
+main().catch((err) => {
+  process.exitCode = 1;
+  // eslint-disable-next-line no-console
+  console.error('[notify-hook] fatal error:', err);
+});

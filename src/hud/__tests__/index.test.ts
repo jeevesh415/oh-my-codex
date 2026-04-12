@@ -16,6 +16,10 @@ function emptyCtx(): HudRenderContext {
     ralph: null,
     ultrawork: null,
     autopilot: null,
+    ralplan: null,
+    deepInterview: null,
+    autoresearch: null,
+    ultraqa: null,
     team: null,
     metrics: null,
     hudNotify: null,
@@ -25,6 +29,14 @@ function emptyCtx(): HudRenderContext {
 
 function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitFor(predicate: () => boolean, attempts = 20): Promise<void> {
+  for (let index = 0; index < attempts; index += 1) {
+    if (predicate()) return;
+    await flush();
+  }
+  assert.ok(predicate(), 'condition should become true before timeout');
 }
 
 afterEach(() => {
@@ -111,8 +123,7 @@ describe('runWatchMode', () => {
     timerTick?.();
 
     releaseFirstRender?.();
-    await flush();
-    await flush();
+    await waitFor(() => callCount === 2);
 
     sigintHandler?.();
     await promise;

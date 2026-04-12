@@ -5,6 +5,7 @@
  */
 
 import { execFileSync, execSync } from "child_process";
+import { buildCapturePaneArgv } from "./tmux-detector.js";
 
 const TMUX_PANE_TARGET_RE = /^%\d+$/;
 const DEFAULT_CAPTURE_LINES = 12;
@@ -33,7 +34,8 @@ export function getCurrentTmuxSession(): string | null {
         encoding: "utf-8",
         timeout: 3000,
         stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
+      windowsHide: true,
+    }).trim();
       if (sessionName) return sessionName;
     } catch {
       // fall through to PID-based detection
@@ -53,6 +55,7 @@ export function getCurrentTmuxSession(): string | null {
  * is a child of a tmux pane process.
  */
 function detectTmuxSessionByPid(): string | null {
+  if (process.platform === 'win32') return null;
   try {
     // Get all tmux pane PIDs with their session names
     const output = execSync(
@@ -93,7 +96,8 @@ function detectTmuxSessionByPid(): string | null {
           encoding: "utf-8",
           timeout: 1000,
           stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
+      windowsHide: true,
+    }).trim();
         const ppid = parseInt(ppidStr, 10);
         if (isNaN(ppid) || ppid <= 1) break;
         currentPid = ppid;
@@ -146,10 +150,11 @@ export function captureTmuxPane(paneId?: string | null, lines: number = 12): str
   const clampedLines = Math.max(1, Math.min(MAX_CAPTURE_LINES, safeLines));
 
   try {
-    const output = execFileSync("tmux", ["capture-pane", "-t", target, "-p", "-S", `-${clampedLines}`], {
+    const output = execFileSync("tmux", buildCapturePaneArgv(target, clampedLines), {
       encoding: "utf-8",
       timeout: 3000,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     }).trim();
     return output || null;
   } catch {
@@ -205,6 +210,7 @@ export function getCurrentTmuxPaneId(): string | null {
  * Detect tmux pane ID by walking the process tree.
  */
 function detectTmuxPaneByPid(): string | null {
+  if (process.platform === 'win32') return null;
   try {
     const output = execSync(
       "tmux list-panes -a -F '#{pane_pid} #{pane_id}'",
@@ -239,7 +245,8 @@ function detectTmuxPaneByPid(): string | null {
           encoding: "utf-8",
           timeout: 1000,
           stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
+      windowsHide: true,
+    }).trim();
         const ppid = parseInt(ppidStr, 10);
         if (isNaN(ppid) || ppid <= 1) break;
         currentPid = ppid;

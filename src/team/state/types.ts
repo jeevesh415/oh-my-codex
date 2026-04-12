@@ -1,5 +1,6 @@
 import type { TeamPhase, TerminalPhase } from '../orchestrator.js';
-import type { TeamTaskStatus, TeamEventType } from '../contracts.js';
+import type { TeamDispatchRequestStatus, TeamEventType, TeamTaskStatus } from '../contracts.js';
+import type { TeamReminderIntent } from '../reminder-intents.js';
 import type { WorktreeMode } from '../worktree.js';
 
 export interface TeamConfig {
@@ -7,7 +8,7 @@ export interface TeamConfig {
   task: string;
   agent_type: string;
   worker_launch_mode: 'interactive' | 'prompt';
-  lifecycle_profile: 'default' | 'linked_ralph';
+  lifecycle_profile: 'default';
   worker_count: number;
   max_workers: number;
   workers: WorkerInfo[];
@@ -111,7 +112,6 @@ export interface TeamGovernance {
 }
 
 export type TeamDispatchRequestKind = 'inbox' | 'mailbox' | 'nudge';
-export type TeamDispatchRequestStatus = 'pending' | 'notified' | 'delivered' | 'failed';
 export type TeamDispatchTransportPreference = 'hook_preferred_with_fallback' | 'transport_direct' | 'prompt_stdin';
 
 export interface TeamDispatchRequest {
@@ -122,6 +122,7 @@ export interface TeamDispatchRequest {
   worker_index?: number;
   pane_id?: string;
   trigger_message: string;
+  intent?: TeamReminderIntent;
   message_id?: string;
   inbox_correlation_key?: string;
   transport_preference: TeamDispatchTransportPreference;
@@ -142,6 +143,7 @@ export interface TeamDispatchRequestInput {
   worker_index?: number;
   pane_id?: string;
   trigger_message: string;
+  intent?: TeamReminderIntent;
   message_id?: string;
   inbox_correlation_key?: string;
   transport_preference?: TeamDispatchTransportPreference;
@@ -162,7 +164,7 @@ export interface TeamManifestV2 {
   leader: TeamLeader;
   policy: TeamPolicy;
   governance: TeamGovernance;
-  lifecycle_profile: 'default' | 'linked_ralph';
+  lifecycle_profile: 'default';
   permissions_snapshot: PermissionsSnapshot;
   tmux_session: string;
   worker_count: number;
@@ -195,6 +197,7 @@ export interface TeamEvent {
   task_id?: string;
   message_id?: string | null;
   reason?: string;
+  intent?: TeamReminderIntent;
   state?: WorkerStatus['state'];
   prev_state?: WorkerStatus['state'];
   worker_count?: number;

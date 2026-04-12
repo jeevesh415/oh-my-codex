@@ -9,6 +9,7 @@ import {
 } from "../verification/verifier.js";
 import { codexHome, listInstalledSkillDirectories } from "../utils/paths.js";
 import { sleep } from "../utils/sleep.js";
+import type { TeamReminderDirective } from "./reminder-intents.js";
 
 const TEAM_OVERLAY_START = "<!-- OMX:TEAM:WORKER:START -->";
 const TEAM_OVERLAY_END = "<!-- OMX:TEAM:WORKER:END -->";
@@ -126,6 +127,7 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
       cwd,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     }).trim();
     return value || null;
   } catch {
@@ -139,6 +141,7 @@ function isTracked(worktreePath: string, fileName: string): boolean {
       cwd: worktreePath,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
     return true;
   } catch {
@@ -183,7 +186,8 @@ export async function writeWorkerWorktreeRootAgentsFile(
         cwd: options.worktreePath,
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "pipe"],
-      });
+      windowsHide: true,
+    });
       skipWorktreeApplied = true;
     } catch {
       skipWorktreeApplied = false;
@@ -247,7 +251,8 @@ export async function removeWorkerWorktreeRootAgentsFile(
         cwd: worktreePath,
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "pipe"],
-      });
+      windowsHide: true,
+    });
     } catch {
       // Best-effort cleanup only.
     }
@@ -806,6 +811,14 @@ export function generateTriggerMessage(
   teamName: string,
   teamStateRoot: string = ".omx/state",
 ): string {
+  return buildTriggerDirective(workerName, teamName, teamStateRoot).text;
+}
+
+export function buildTriggerDirective(
+  workerName: string,
+  teamName: string,
+  teamStateRoot: string = ".omx/state",
+): TeamReminderDirective {
   const inboxPath = buildInstructionPath(
     teamStateRoot,
     "team",
@@ -815,9 +828,15 @@ export function generateTriggerMessage(
     "inbox.md",
   );
   if (teamStateRoot !== ".omx/state") {
-    return `Read ${inboxPath}, work now, report progress, continue assigned work or next feasible task.`;
+    return {
+      intent: "followup-relaunch",
+      text: `Read ${inboxPath}, work now, report progress, continue assigned work or next feasible task.`,
+    };
   }
-  return `Read ${inboxPath}, start work now, report concrete progress, then continue assigned work or next feasible task.`;
+  return {
+    intent: "followup-relaunch",
+    text: `Read ${inboxPath}, start work now, report concrete progress, then continue assigned work or next feasible task.`,
+  };
 }
 
 /**
@@ -830,6 +849,15 @@ export function generateMailboxTriggerMessage(
   count: number,
   teamStateRoot: string = ".omx/state",
 ): string {
+  return buildMailboxTriggerDirective(workerName, teamName, count, teamStateRoot).text;
+}
+
+export function buildMailboxTriggerDirective(
+  workerName: string,
+  teamName: string,
+  count: number,
+  teamStateRoot: string = ".omx/state",
+): TeamReminderDirective {
   const n = Number.isFinite(count) ? Math.max(1, Math.floor(count)) : 1;
   const mailboxPath = buildInstructionPath(
     teamStateRoot,
@@ -839,9 +867,15 @@ export function generateMailboxTriggerMessage(
     workerName + ".json",
   );
   if (teamStateRoot !== ".omx/state") {
-    return `${n} new msg(s): read ${mailboxPath}, act, report progress, continue assigned work or next feasible task.`;
+    return {
+      intent: "pending-mailbox-review",
+      text: `${n} new msg(s): read ${mailboxPath}, act, report progress, continue assigned work or next feasible task.`,
+    };
   }
-  return `You have ${n} new message(s). Read ${mailboxPath}, act now, reply with concrete progress, then continue assigned work or next feasible task.`;
+  return {
+    intent: "pending-mailbox-review",
+    text: `You have ${n} new message(s). Read ${mailboxPath}, act now, reply with concrete progress, then continue assigned work or next feasible task.`,
+  };
 }
 
 export function generateLeaderMailboxTriggerMessage(
@@ -849,6 +883,14 @@ export function generateLeaderMailboxTriggerMessage(
   fromWorker: string,
   teamStateRoot: string = ".omx/state",
 ): string {
+  return buildLeaderMailboxTriggerDirective(teamName, fromWorker, teamStateRoot).text;
+}
+
+export function buildLeaderMailboxTriggerDirective(
+  teamName: string,
+  fromWorker: string,
+  teamStateRoot: string = ".omx/state",
+): TeamReminderDirective {
   const mailboxPath = buildInstructionPath(
     teamStateRoot,
     "team",
@@ -857,7 +899,13 @@ export function generateLeaderMailboxTriggerMessage(
     "leader-fixed.json",
   );
   if (teamStateRoot !== ".omx/state") {
-    return `Read ${mailboxPath}; new msg from ${fromWorker}. Review it; decide next step.`;
+    return {
+      intent: "pending-mailbox-review",
+      text: `Read ${mailboxPath}; new msg from ${fromWorker}. Review it; decide next step.`,
+    };
   }
-  return `Read ${mailboxPath}; ${fromWorker} sent a new message. Review it and decide the next concrete step.`;
+  return {
+    intent: "pending-mailbox-review",
+    text: `Read ${mailboxPath}; ${fromWorker} sent a new message. Review it and decide the next concrete step.`,
+  };
 }

@@ -13,7 +13,7 @@ function runOmx(
 ): { status: number | null; stdout: string; stderr: string; error: string } {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
-  const omxBin = join(repoRoot, 'bin', 'omx.js');
+  const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
   const result = spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: 'utf-8',
@@ -37,11 +37,14 @@ describe('omx resume', () => {
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
       await writeFile(fakeCodexPath, '#!/bin/sh\nprintf \'fake-codex:%s\\n\' \"$*\"\n');
       await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
 
       const result = runOmx(wd, ['resume', '--last'], {
         HOME: home,
@@ -64,11 +67,14 @@ describe('omx resume', () => {
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
       await writeFile(fakeCodexPath, '#!/bin/sh\nprintf \'fake-codex:%s\\n\' \"$*\"\n');
       await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
 
       const result = runOmx(wd, ['resume', '--help'], {
         HOME: home,

@@ -14,7 +14,7 @@ function count(text: string, pattern: RegExp): number {
   return (text.match(pattern) ?? []).length;
 }
 
-/** Assert the OMX block appears exactly once */
+/** Assert the current OMX block appears exactly once */
 function assertSingleOmxBlock(toml: string): void {
   assert.equal(
     count(toml, /# oh-my-codex \(OMX\) Configuration/g),
@@ -46,11 +46,26 @@ function assertSingleOmxBlock(toml: string): void {
     1,
     "[mcp_servers.omx_trace] should appear once",
   );
+  assert.equal(
+    count(toml, /^\[mcp_servers\.omx_team_run\]$/gm),
+    0,
+    "[mcp_servers.omx_team_run] should not be emitted",
+  );
+  assert.doesNotMatch(
+    toml,
+    /dist\/mcp\/team-server\.js/,
+    "team-server path should not be emitted",
+  );
   assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
   assert.equal(
     count(toml, /^\[features\]$/gm),
     1,
     "[features] should appear once",
+  );
+  assert.equal(
+    count(toml, /^codex_hooks = true$/gm),
+    1,
+    "codex_hooks should appear once",
   );
   assert.equal(
     count(toml, /^notify\s*=/gm),
@@ -67,10 +82,16 @@ function assertSingleOmxBlock(toml: string): void {
     1,
     "developer_instructions should appear once",
   );
+  assert.equal(count(toml, /^\[env\]$/gm), 1, "[env] should appear once");
+  assert.equal(
+    count(toml, /^USE_OMX_EXPLORE_CMD = "1"$/gm),
+    1,
+    "USE_OMX_EXPLORE_CMD should appear once",
+  );
 }
 
 describe("config generator idempotency (#384)", () => {
-  it("first run creates config with all OMX sections", async () => {
+  it("first run creates config with all current OMX sections", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
       const configPath = join(wd, "config.toml");
@@ -80,6 +101,7 @@ describe("config generator idempotency (#384)", () => {
       assertSingleOmxBlock(toml);
       assert.match(toml, /^multi_agent = true$/m);
       assert.match(toml, /^child_agents_md = true$/m);
+      assert.match(toml, /^codex_hooks = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -349,12 +371,41 @@ describe("config generator idempotency (#384)", () => {
       assert.match(toml, /^theme = "night"$/m, "user tui key preserved");
       assert.match(
         toml,
-        /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit"\]$/m,
+        /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
         "status_line updated in-place",
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("skips emitting an OMX [tui] table when includeTui is disabled", () => {
+    const toml = buildMergedConfig("", "/tmp/omx", {
+      includeTui: false,
+    });
+
+    assert.doesNotMatch(toml, /^\[tui\]$/m);
+    assert.match(toml, /^\[mcp_servers\.omx_state\]$/m);
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+  });
+
+  it('seeds USE_OMX_EXPLORE_CMD=1 into generated config by default', () => {
+    const toml = buildMergedConfig('', '/tmp/omx');
+
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "1"$/m);
+  });
+
+  it('preserves existing [env] keys and explicit explore routing opt-outs', () => {
+    const toml = buildMergedConfig(
+      ['[env]', 'FOO = "bar"', 'USE_OMX_EXPLORE_CMD = "0"', ''].join('\n'),
+      '/tmp/omx',
+    );
+
+    assert.match(toml, /^\[env\]$/m);
+    assert.match(toml, /^FOO = "bar"$/m);
+    assert.match(toml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
   });
 
   it("replaces an existing OMX notify entry without leaving orphan fragments behind", async () => {
@@ -550,6 +601,83 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
+  it("mergeConfig removes legacy omx_team_run tables during setup upgrade", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const legacy = [
+        '[user.before]',
+        'name = "kept-before"',
+        "",
+        '# ============================================================',
+        '# oh-my-codex (OMX) Configuration',
+        '# Managed by omx setup - manual edits preserved on next setup',
+        '# ============================================================',
+        "",
+        '[mcp_servers.omx_team_run]',
+        'command = "node"',
+        'args = ["/tmp/team-server.js"]',
+        'enabled = true',
+        "",
+        '# ============================================================',
+        '# End oh-my-codex',
+        "",
+        '[user.after]',
+        'name = "kept-after"',
+        "",
+      ].join("\n");
+      await writeFile(configPath, legacy);
+
+      await mergeConfig(configPath, wd);
+      const toml = await readFile(configPath, "utf-8");
+
+      assertSingleOmxBlock(toml);
+      assert.doesNotMatch(toml, /^\[mcp_servers\.omx_team_run\]$/m);
+      assert.doesNotMatch(toml, /team-server\.js/);
+      assert.match(toml, /^\[user\.before\]$/m);
+      assert.match(toml, /^name = "kept-before"$/m);
+      assert.match(toml, /^\[user\.after\]$/m);
+      assert.match(toml, /^name = "kept-after"$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("repairConfigIfNeeded removes legacy omx_team_run tables during launch repair", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const legacy = [
+        '[user.before]',
+        'name = "kept-before"',
+        "",
+        '[mcp_servers.omx_team_run]',
+        'command = "node"',
+        'args = ["/tmp/team-server.js"]',
+        'enabled = true',
+        "",
+        '[user.after]',
+        'name = "kept-after"',
+        "",
+      ].join("\n");
+      await writeFile(configPath, legacy);
+
+      const didRepair = await repairConfigIfNeeded(configPath, wd);
+      assert.equal(didRepair, true, "legacy team-run config should be repaired");
+
+      const toml = await readFile(configPath, "utf-8");
+      assertSingleOmxBlock(toml);
+      assert.doesNotMatch(toml, /^\[mcp_servers\.omx_team_run\]$/m);
+      assert.doesNotMatch(toml, /team-server\.js/);
+      assert.match(toml, /^\[user\.before\]$/m);
+      assert.match(toml, /^name = "kept-before"$/m);
+      assert.match(toml, /^\[user\.after\]$/m);
+      assert.match(toml, /^name = "kept-after"$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("repairConfigIfNeeded fixes duplicate [tui] and is a no-op when clean", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
@@ -627,7 +755,7 @@ describe("config generator idempotency (#384)", () => {
 
   it("skips shared MCP entries that already exist in user config", () => {
     const existing = [
-      "[mcp_servers.gitnexus]",
+      "[mcp_servers.existing_server]",
       'command = "custom"',
       'args = ["serve"]',
       "",
@@ -635,8 +763,8 @@ describe("config generator idempotency (#384)", () => {
     const merged = buildMergedConfig(existing, "/tmp/omx", {
       sharedMcpServers: [
         {
-          name: "gitnexus",
-          command: "gitnexus",
+          name: "existing_server",
+          command: "existing-server",
           args: ["mcp"],
           enabled: true,
         },
@@ -650,9 +778,85 @@ describe("config generator idempotency (#384)", () => {
       sharedMcpRegistrySource: "/tmp/.omx/mcp-registry.json",
     });
 
-    assert.equal(count(merged, /^\[mcp_servers\.gitnexus\]$/gm), 1);
+    assert.equal(count(merged, /^\[mcp_servers\.existing_server\]$/gm), 1);
     assert.match(merged, /command = "custom"/);
     assert.equal(count(merged, /^\[mcp_servers\.eslint\]$/gm), 1);
+  });
+
+  it("adds a default startup timeout to launcher-backed non-OMX MCP servers and stays idempotent", () => {
+    const existing = [
+      '[mcp_servers.filesystem]',
+      'command = "npx"',
+      'args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]',
+      "",
+    ].join("\n");
+
+    const first = buildMergedConfig(existing, "/tmp/omx");
+    const second = buildMergedConfig(first, "/tmp/omx");
+
+    assert.match(first, /^\[mcp_servers\.filesystem\]$/m);
+    assert.match(first, /^startup_timeout_sec = 15$/m);
+    assert.equal(count(second, /^startup_timeout_sec = 15$/gm), 1);
+  });
+
+  it("preserves explicit launcher timeouts and leaves non-launcher MCP servers untouched", () => {
+    const existing = [
+      '[mcp_servers.fetch]',
+      'command = "uvx"',
+      'args = ["mcp-server-fetch"]',
+      "startup_timeout_sec = 22",
+      "",
+      '[mcp_servers.custom]',
+      'command = "custom-mcp"',
+      'args = ["serve"]',
+      "",
+    ].join("\n");
+
+    const merged = buildMergedConfig(existing, "/tmp/omx");
+
+    assert.equal(count(merged, /^startup_timeout_sec = 22$/gm), 1);
+    assert.doesNotMatch(
+      merged,
+      /\[mcp_servers\.custom\][\s\S]*?startup_timeout_sec = 15/,
+    );
+  });
+
+  it("treats npm exec launchers as timeout-backed MCP commands", () => {
+    const existing = [
+      '[mcp_servers.seq]',
+      'command = "npm"',
+      'args = ["exec", "@modelcontextprotocol/server-sequential-thinking"]',
+      "",
+    ].join("\n");
+
+    const merged = buildMergedConfig(existing, "/tmp/omx");
+
+    assert.match(merged, /^\[mcp_servers\.seq\]$/m);
+    assert.match(merged, /^startup_timeout_sec = 15$/m);
+  });
+
+  it("repairConfigIfNeeded backfills launcher-backed MCP startup timeouts", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      await writeFile(
+        configPath,
+        [
+          '[mcp_servers.filesystem]',
+          'command = "npx"',
+          'args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]',
+          "",
+        ].join("\n"),
+      );
+
+      const repaired = await repairConfigIfNeeded(configPath, wd);
+      const config = await readFile(configPath, "utf-8");
+
+      assert.equal(repaired, true);
+      assert.match(config, /^startup_timeout_sec = 15$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 
 });
