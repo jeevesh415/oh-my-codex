@@ -6,16 +6,16 @@
 
 import { readFile } from 'fs/promises';
 import { readFileSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
-import { omxStateDir } from '../utils/paths.js';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
-import { getReadScopedStateFilePaths, getReadScopedStatePaths } from '../mcp/state-paths.js';
+import { getBaseStateDir, getReadScopedStateFilePaths, getReadScopedStatePaths, readCurrentSessionId } from '../mcp/state-paths.js';
+import { teamReadPhase as readTeamPhase } from '../team/team-ops.js';
 import { readUsableSessionState } from '../hooks/session.js';
-import { listActiveSkills, readVisibleSkillActiveState } from '../state/skill-active.js';
+import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
 import type {
   RalphStateForHud,
   UltraworkStateForHud,
@@ -46,9 +46,9 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
 
 async function readSessionAwareModeState<T>(cwd: string, mode: string): Promise<T | null> {
   const candidates = await getReadScopedStatePaths(mode, cwd);
-  const session = await readSessionState(cwd);
+  const sessionId = await readCurrentSessionId(cwd);
 
-  if (session?.session_id) {
+  if (sessionId) {
     if (candidates.length === 0) return null;
     return readJsonFile<T>(candidates[0]);
   }
@@ -81,6 +81,9 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
     git: {
       ...DEFAULT_HUD_CONFIG.git,
     },
+    statusLine: {
+      preset: DEFAULT_HUD_CONFIG.statusLine.preset,
+    },
   };
 
   if (!raw || typeof raw !== 'object') return normalized;
@@ -99,6 +102,12 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
 
     const repoLabel = sanitizeOptionalString(raw.git.repoLabel);
     if (repoLabel) normalized.git.repoLabel = repoLabel;
+  }
+
+  if (raw.statusLine && typeof raw.statusLine === 'object') {
+    if (isValidPreset(raw.statusLine.preset)) {
+      normalized.statusLine.preset = raw.statusLine.preset;
+    }
   }
 
   return normalized;
@@ -215,8 +224,9 @@ function runGit(cwd: string, args: string[]): string | null {
           const config = readGitLayoutFile(gitLayout.gitDir, 'config')
             ?? readGitLayoutFile(gitLayout.commonDir, 'config');
           if (config) {
+            const escaped = remoteName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
             const re = new RegExp(
-              `\\[remote "${remoteName}"\\][\\s\\S]*?url\\s*=\\s*(.+)`,
+              `\\[remote "${escaped}"\\][\\s\\S]*?url\\s*=\\s*(.+)`,
               'm',
             );
             const m = config.match(re);
@@ -247,7 +257,7 @@ function runGit(cwd: string, args: string[]): string | null {
 
 function runGitExec(cwd: string, args: string[]): string | null {
   try {
-    return execSync(`git ${args.join(' ')}`, {
+    return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
       timeout: 2000,
@@ -330,6 +340,25 @@ export function buildGitBranchLabel(
   return repoLabel ? `${repoLabel}/${branch}` : branch;
 }
 
+const TERMINAL_OR_INACTIVE_PHASES = new Set(['complete', 'completed', 'cancelled', 'canceled', 'failed', 'inactive', 'cleared']);
+
+function isMissingTerminalOrInactiveDetail(detail: { active?: boolean; current_phase?: string } | null): boolean {
+  if (!detail) return true;
+  if (detail.active !== true) return true;
+  const phase = sanitizeOptionalString(detail.current_phase)?.toLowerCase();
+  return phase ? TERMINAL_OR_INACTIVE_PHASES.has(phase) : false;
+}
+
+function shouldSurfaceCanonicalSkill(
+  canonicalSkills: Map<string, { phase?: string }>,
+  skill: string,
+  detail: { active?: boolean; current_phase?: string } | null,
+  useCompatibilityFallback: boolean,
+): boolean {
+  if (!canonicalSkills.has(skill) && !useCompatibilityFallback) return false;
+  return !isMissingTerminalOrInactiveDetail(detail);
+}
+
 function canonicalPhaseForSkill(
   canonicalSkills: Map<string, { phase?: string }>,
   skill: string,
@@ -349,16 +378,38 @@ function mergePhase<T extends { active?: boolean; current_phase?: string }>(
   return { active: true, current_phase: canonicalPhase } as T;
 }
 
+async function readCanonicalTeamPhase(cwd: string, teamDetail: TeamStateForHud | null): Promise<string | undefined> {
+  const teamName = sanitizeOptionalString(teamDetail?.team_name);
+  if (!teamName) return undefined;
+  const phaseState = await readTeamPhase(teamName, cwd).catch(() => null);
+  return sanitizeOptionalString(phaseState?.current_phase);
+}
+
+function mergeTeamPhase(
+  detail: TeamStateForHud | null,
+  canonicalSkillPhase?: string,
+  canonicalTeamPhase?: string,
+): TeamStateForHud | null {
+  const canonicalPhase = canonicalTeamPhase || canonicalSkillPhase;
+  if (detail?.active === true) {
+    return canonicalPhase ? { ...detail, current_phase: canonicalPhase } : detail;
+  }
+  if (!canonicalPhase) return null;
+  return { active: true, current_phase: canonicalPhase };
+}
+
 /** Read all state files and build the full render context */
 export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFAULT_HUD_CONFIG): Promise<HudRenderContext> {
   const version = readVersion();
   const gitBranch = buildGitBranchLabel(cwd, config);
-  const [metrics, hudNotify, session] = await Promise.all([
+  const [metrics, hudNotify, session, currentSessionId] = await Promise.all([
     readMetrics(cwd),
     readHudNotifyState(cwd),
     readSessionState(cwd),
+    readCurrentSessionId(cwd),
   ]);
-  const canonicalSkillState = await readVisibleSkillActiveState(cwd, session?.session_id);
+  const stateDir = getBaseStateDir(cwd);
+  const canonicalSkillState = await readVisibleSkillActiveStateForStateDir(stateDir, currentSessionId);
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
   );
@@ -384,19 +435,19 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     readSessionAwareModeState<TeamStateForHud>(cwd, 'team'),
   ]);
 
-  const ralph = canonicalSkills.has('ralph') || useCompatibilityFallback
+  const ralph = shouldSurfaceCanonicalSkill(canonicalSkills, 'ralph', ralphDetail, useCompatibilityFallback)
     ? (ralphDetail?.active === true ? mergePhase(ralphDetail, canonicalPhaseForSkill(canonicalSkills, 'ralph')) : null)
     : null;
-  const ultrawork = canonicalSkills.has('ultrawork') || useCompatibilityFallback
+  const ultrawork = shouldSurfaceCanonicalSkill(canonicalSkills, 'ultrawork', ultraworkDetail, useCompatibilityFallback)
     ? mergePhase(ultraworkDetail?.active === true ? ultraworkDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ultrawork'))
     : null;
-  const autopilot = canonicalSkills.has('autopilot') || useCompatibilityFallback
+  const autopilot = shouldSurfaceCanonicalSkill(canonicalSkills, 'autopilot', autopilotDetail, useCompatibilityFallback)
     ? mergePhase(autopilotDetail?.active === true ? autopilotDetail : null, canonicalPhaseForSkill(canonicalSkills, 'autopilot'))
     : null;
-  const ralplan = canonicalSkills.has('ralplan') || useCompatibilityFallback
+  const ralplan = shouldSurfaceCanonicalSkill(canonicalSkills, 'ralplan', ralplanDetail, useCompatibilityFallback)
     ? mergePhase(ralplanDetail?.active === true ? ralplanDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ralplan'))
     : null;
-  const deepInterview = canonicalSkills.has('deep-interview') || useCompatibilityFallback
+  const deepInterview = shouldSurfaceCanonicalSkill(canonicalSkills, 'deep-interview', deepInterviewDetail, useCompatibilityFallback)
     ? (() => {
       const merged = mergePhase(
         deepInterviewDetail?.active === true ? {
@@ -408,13 +459,18 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
       return merged;
     })()
     : null;
-  const ultraqa = canonicalSkills.has('ultraqa') || useCompatibilityFallback
+  const ultraqa = shouldSurfaceCanonicalSkill(canonicalSkills, 'ultraqa', ultraqaDetail, useCompatibilityFallback)
     ? mergePhase(ultraqaDetail?.active === true ? ultraqaDetail : null, canonicalPhaseForSkill(canonicalSkills, 'ultraqa'))
     : null;
-  const team = canonicalSkills.has('team') || useCompatibilityFallback
-    ? mergePhase(teamDetail?.active === true ? teamDetail : null, canonicalPhaseForSkill(canonicalSkills, 'team'))
+  const canonicalTeamPhase = await readCanonicalTeamPhase(cwd, teamDetail?.active === true ? teamDetail : null);
+  const team = shouldSurfaceCanonicalSkill(canonicalSkills, 'team', teamDetail, useCompatibilityFallback)
+    ? mergeTeamPhase(
+      teamDetail?.active === true ? teamDetail : null,
+      canonicalPhaseForSkill(canonicalSkills, 'team'),
+      canonicalTeamPhase,
+    )
     : null;
-  const autoresearch = canonicalSkills.has('autoresearch') || useCompatibilityFallback
+  const autoresearch = shouldSurfaceCanonicalSkill(canonicalSkills, 'autoresearch', autoresearchDetail, useCompatibilityFallback)
     ? mergePhase(
       autoresearchDetail?.active === true ? autoresearchDetail : null,
       canonicalPhaseForSkill(canonicalSkills, 'autoresearch'),
@@ -425,7 +481,6 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
   // for authority/backlog/readiness display over JS-inferred state.
   let runtimeSnapshot: RuntimeSnapshot | null = null;
   if (isBridgeEnabled()) {
-    const stateDir = omxStateDir(cwd);
     const bridge = getDefaultBridge(stateDir);
     runtimeSnapshot = bridge.readCompatFile<RuntimeSnapshot>('snapshot.json');
   }

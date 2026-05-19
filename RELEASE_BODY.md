@@ -1,55 +1,43 @@
-# oh-my-codex v0.12.6
+# oh-my-codex 0.18.0
 
-**Wiki-first knowledge workflows, hook/notification hardening, launch safety improvements, and dev-merge issue auto-close**
-
-`0.12.6` is the `v0.12.5..v0.12.6` patch train across 32 PR merges. It ships OMX wiki as a first-class local knowledge workflow, deepens hook/notification/session-state hardening, improves launch/worktree safety, and adds automation that closes explicitly linked issues after merges into `dev`.
+`0.18.0` ships the OMX API gateway and a safer SparkShell/operator-runtime baseline after `0.17.3`. The release also closes the notify, Stop-hook, tmux, HUD, Windows MCP, and release-smoke blockers found while preparing the train.
 
 ## Highlights
 
-- **OMX wiki is now first-class** — local markdown wiki storage, query/lint/refresh flows, CLI/MCP parity, and explore integration all land together (#1481).
-- **Hook and session-state hardening** — native hook, notify hook, lifecycle dedupe, reply-listener/session-status, and HUD cleanup paths are more stable and less noisy (#1487, #1491, #1493, #1495, #1496, #1514, #1518, #1520, #1526, #1529, #1539).
-- **Launch/operator safety** — reusable worktree dependency bootstrap, AGENTS preservation during setup, proxy inheritance, dirty-worktree caution handling, and Claude issue approval-flow smoothing all improve day-to-day operator reliability (#1507, #1521, #1522, #1532, #1536).
-- **Discord + dev-merge workflow automation** — tracked Discord sessions get safer control primitives, and merged `dev` PRs can auto-close explicitly linked issues (#1528, #1540).
+- **Local generation has an OMX-owned API path** — `omx api` exposes the local gateway used by OMX generation flows, with explicit real-private backend guidance and safer default auth behavior.
+- **SparkShell is safer and more observable** — summaries can diagnose team panes and cache observations while preserving passthrough contracts and keeping raw secrets out of summary prompts.
+- **Runtime loops are less sticky** — stale Ralph, ralplan, autoresearch-goal, MCP transport, and tmux diagnostic states no longer trigger erroneous loops after Stop/completion.
+- **Process-storm regressions are blocked** — recursive notify wrappers, `previousNotify` self-reference, fallback watcher respawns, and worker tmux rc fan-out are fixed.
+- **Team/HUD/Windows reliability improved** — wrapped tmux drafts are not treated as sent input, HUD resize hooks survive reflow, provider env vars reach direct tmux launches, and Windows MCP siblings avoid duplicate watchdog collisions.
 
-## What's Changed
+## Fixes / compatibility
 
-### Added
-- OMX wiki workflow, storage engine, CLI/MCP parity, and wiki-aware explore behavior (PR [#1481](https://github.com/Yeachan-Heo/oh-my-codex/pull/1481))
-- Discord tracked-session control primitive and safer message-id reuse handling (PR [#1530](https://github.com/Yeachan-Heo/oh-my-codex/pull/1530))
-- Auto-close workflow for explicitly linked issues after `dev` merges (PR [#1541](https://github.com/Yeachan-Heo/oh-my-codex/pull/1541))
+- `omx api --help` and `omx sparkshell --help` are now covered by release smoke tests.
+- Real-private API mode remains experimental and explicitly opt-in; unauthenticated accidental startup is prevented by default token generation.
+- Team readiness semantics are preserved; the release removes false draft trust and runaway launch/fan-out behavior rather than weakening failure detection.
+- Lifecycle notification grouping remains tracked separately in #2353.
 
-### Fixed — Hooks / notifications / session state
-- Needs-input watcher parity for array-backed assistant prompts (PR [#1487](https://github.com/Yeachan-Heo/oh-my-codex/pull/1487))
-- Local worker runtime startup / dispatch stability (PRs [#1491](https://github.com/Yeachan-Heo/oh-my-codex/pull/1491), [#1493](https://github.com/Yeachan-Heo/oh-my-codex/pull/1493))
-- Managed-session hook cwd alias and ownership stability (PR [#1495](https://github.com/Yeachan-Heo/oh-my-codex/pull/1495))
-- Ralph steer / release-readiness follow-up scoping (PRs [#1496](https://github.com/Yeachan-Heo/oh-my-codex/pull/1496), [#1514](https://github.com/Yeachan-Heo/oh-my-codex/pull/1514))
-- Lifecycle/keyword alert noise reduction and post-stop replay suppression (PRs [#1518](https://github.com/Yeachan-Heo/oh-my-codex/pull/1518), [#1520](https://github.com/Yeachan-Heo/oh-my-codex/pull/1520), [#1526](https://github.com/Yeachan-Heo/oh-my-codex/pull/1526), [#1529](https://github.com/Yeachan-Heo/oh-my-codex/pull/1529))
-- Dead-session HUD residue cleanup before follow-up tooling reads it (PR [#1539](https://github.com/Yeachan-Heo/oh-my-codex/pull/1539))
+## Merged PR inventory
 
-### Fixed — Launch / setup / operator safety
-- Reusable worktree dependency bootstrap (PR [#1510](https://github.com/Yeachan-Heo/oh-my-codex/pull/1510))
-- Defensive handling for malformed native-hook stdin JSON (PR [#1504](https://github.com/Yeachan-Heo/oh-my-codex/pull/1504))
-- Preserve user-authored AGENTS guidance during setup (PR [#1524](https://github.com/Yeachan-Heo/oh-my-codex/pull/1524))
-- Preserve tmux worker proxy environment inheritance (PR [#1523](https://github.com/Yeachan-Heo/oh-my-codex/pull/1523))
-- Dirty worktree caution flow with hard-failure preservation outside launch reuse (PR [#1535](https://github.com/Yeachan-Heo/oh-my-codex/pull/1535))
-- Claude issue sessions continue through obvious repo reads without unnecessary approval stalls (PR [#1537](https://github.com/Yeachan-Heo/oh-my-codex/pull/1537))
+#2295, #2332, #2334, #2335, #2338, #2339, #2341, #2342, #2344, #2345, #2347, #2349, #2351, #2357, #2359, #2360, #2361, #2365, #2367, #2372, #2374, #2375, #2376.
 
-### Fixed — MCP / docs / workflow surfaces
-- Superseded MCP stdio sibling cleanup under live Codex app-server parents (PR [#1517](https://github.com/Yeachan-Heo/oh-my-codex/pull/1517))
-- Canonical mixed OMX + Codex skill-root documentation plus wiki docs refresh (PR [#1534](https://github.com/Yeachan-Heo/oh-my-codex/pull/1534))
+## Validation
 
-## Verification
-
-- `npm run build` ✅
-- `npm run lint` ✅
-- `npm test` ✅
-- `npm run test:recent-bug-regressions` ✅
-- `node --test dist/cli/__tests__/version-sync-contract.test.js` ✅
-- `npm run smoke:packed-install` ✅
+- `npm run build`
+- `npm run lint`
+- `npm run check:no-unused`
+- Targeted compiled Node tests for version sync and the `omx api` CLI bridge
+- `npm run verify:native-agents`
+- `npm run verify:plugin-bundle`
+- `npm run build:full`
+- `npm run smoke:packed-install`
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test -p omx-api -p omx-sparkshell -p omx-explore-harness`
+- `git diff --check`
 
 ## Contributors
 
-- [@Yeachan-Heo](https://github.com/Yeachan-Heo) (Bellman)
-- [@HaD0Yun](https://github.com/HaD0Yun)
+Thanks to everyone who reported and narrowed the post-`0.17.3` runtime issues, especially the notify dispatcher recursion/fork-bomb reports, tmux fan-out/OOM repro, provider-env launch report, and compaction/reconciliation drift reports.
 
-**Full Changelog**: [`v0.12.5...v0.12.6`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.12.5...v0.12.6)
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.17.3...v0.18.0

@@ -1,9 +1,16 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import { existsSync, statSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, posix, resolve, win32 } from 'node:path';
+import { basename, dirname, join, posix, resolve, sep, win32 } from 'node:path';
 import { omxStateDir } from '../utils/paths.js';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
+
+const MIN_GIT_ACTIVITY_CACHE_TTL_MS = 1000;
+const MAX_GIT_ACTIVITY_CACHE_TTL_MS = 5000;
+const gitActivityCache = new Map<string, { value: number; expiresAt: number }>();
 
 interface LeaderRuntimeActivityDoc {
   last_activity_at?: string;
@@ -53,7 +60,7 @@ function resolveGitOutputPath(cwd: string, gitPath: string | null): string | nul
  *
  * See: https://github.com/Yeachan-Heo/oh-my-codex/issues/1100
  */
-function tryReadGitValue(cwd: string, args: string[]): string | null {
+async function tryReadGitValue(cwd: string, args: string[]): Promise<string | null> {
   if (process.platform === 'win32') {
     try {
       const gitLayout = findGitLayout(cwd);
@@ -75,7 +82,10 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
 
         if (cmd.startsWith('rev-parse --git-path logs/refs/heads/')) {
           const branch = args[args.length - 1].replace('logs/', '');
-          return join(gitLayout.commonDir, 'logs', branch);
+          const candidate = resolve(join(gitLayout.commonDir, 'logs', branch));
+          const resolvedBase = resolve(gitLayout.commonDir);
+          if (candidate !== resolvedBase && !candidate.startsWith(resolvedBase + sep)) return null;
+          return candidate;
         }
 
         if (cmd === 'show -s --format=%ct HEAD') {
@@ -89,19 +99,18 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
     } catch { /* fall through */ }
   }
 
-  return tryReadGitValueExec(cwd, args);
+  return await tryReadGitValueExec(cwd, args);
 }
 
-function tryReadGitValueExec(cwd: string, args: string[]): string | null {
+async function tryReadGitValueExec(cwd: string, args: string[]): Promise<string | null> {
   try {
-    const value = execFileSync('git', args, {
+    const { stdout } = await execFileAsync('git', args, {
       cwd,
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2000,
       windowsHide: true,
-    }).trim();
-    return value || null;
+    });
+    return stdout.trim() || null;
   } catch {
     return null;
   }
@@ -117,19 +126,24 @@ async function statMsIfExists(path: string | null): Promise<number> {
 }
 
 function stateDirToProjectRoot(stateDir: string): string {
+  let current = resolve(stateDir);
+  while (current !== dirname(current)) {
+    if (basename(current) === '.omx') return dirname(current);
+    current = dirname(current);
+  }
   return dirname(dirname(stateDir));
 }
 
 export async function readBranchGitActivityMsForPath(cwd: string): Promise<number> {
-  const gitDir = tryReadGitValue(cwd, ['rev-parse', '--git-dir']);
+  const gitDir = await tryReadGitValue(cwd, ['rev-parse', '--git-dir']);
   if (!gitDir) return Number.NaN;
 
-  const branch = tryReadGitValue(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
-  const headLogPath = tryReadGitValue(cwd, ['rev-parse', '--git-path', 'logs/HEAD']);
+  const branch = await tryReadGitValue(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  const headLogPath = await tryReadGitValue(cwd, ['rev-parse', '--git-path', 'logs/HEAD']);
   const branchLogPath = branch
-    ? tryReadGitValue(cwd, ['rev-parse', '--git-path', `logs/refs/heads/${branch}`])
+    ? await tryReadGitValue(cwd, ['rev-parse', '--git-path', `logs/refs/heads/${branch}`])
     : null;
-  const headCommitEpoch = tryReadGitValue(cwd, ['show', '-s', '--format=%ct', 'HEAD']);
+  const headCommitEpoch = await tryReadGitValue(cwd, ['show', '-s', '--format=%ct', 'HEAD']);
 
   const [headLogMs, branchLogMs] = await Promise.all([
     statMsIfExists(resolveGitOutputPath(cwd, headLogPath)),
@@ -143,6 +157,36 @@ export async function readBranchGitActivityMsForPath(cwd: string): Promise<numbe
 
 async function readLeaderBranchGitActivityMs(stateDir: string): Promise<number> {
   return await readBranchGitActivityMsForPath(stateDirToProjectRoot(stateDir));
+}
+
+function resolveLeaderGitActivityCacheTtlMs(thresholdMs: number): number {
+  if (!Number.isFinite(thresholdMs) || thresholdMs <= 0) {
+    return MAX_GIT_ACTIVITY_CACHE_TTL_MS;
+  }
+
+  return Math.max(
+    MIN_GIT_ACTIVITY_CACHE_TTL_MS,
+    Math.min(MAX_GIT_ACTIVITY_CACHE_TTL_MS, Math.floor(thresholdMs / 4)),
+  );
+}
+
+async function readLeaderBranchGitActivityMsCached(
+  stateDir: string,
+  thresholdMs: number,
+  nowMs: number,
+): Promise<number> {
+  const cacheKey = stateDirToProjectRoot(stateDir);
+  const cached = gitActivityCache.get(cacheKey);
+  if (cached && cached.expiresAt > nowMs) {
+    return cached.value;
+  }
+
+  const value = await readLeaderBranchGitActivityMs(stateDir);
+  gitActivityCache.set(cacheKey, {
+    value,
+    expiresAt: nowMs + resolveLeaderGitActivityCacheTtlMs(thresholdMs),
+  });
+  return value;
 }
 
 export function leaderRuntimeActivityPath(cwd: string): string {
@@ -183,7 +227,7 @@ export async function readLeaderRuntimeSignalStatuses(
   const [hudState, leaderActivity, leaderGitActivityMs] = await Promise.all([
     existsSync(hudPath) ? readJsonIfExists(hudPath) : Promise.resolve(null),
     existsSync(leaderActivityPath) ? readJsonIfExists(leaderActivityPath) : Promise.resolve(null),
-    readLeaderBranchGitActivityMs(stateDir),
+    readLeaderBranchGitActivityMsCached(stateDir, thresholdMs, nowMs),
   ]);
 
   const signals: Array<{ source: LeaderRuntimeSignalStatus['source']; at: unknown; ms?: number }> = [

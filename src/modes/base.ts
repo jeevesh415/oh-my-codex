@@ -14,7 +14,10 @@ import {
 import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
 import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
 import { validateAndNormalizeRalphState } from '../ralph/contract.js';
+import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
+import { syncRunStateFromModeState } from '../runtime/run-state.js';
 import {
+  getAuthoritativeActiveStatePaths,
   getBaseStateDir,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
@@ -28,6 +31,7 @@ export interface ModeState {
   iteration: number;
   max_iterations: number;
   current_phase: string;
+  run_outcome?: string;
   task_description?: string;
   started_at: string;
   completed_at?: string;
@@ -74,6 +78,21 @@ function normalizeRalphModeStateOrThrow(state: ModeState): ModeState {
   return normalized;
 }
 
+function applySharedRunOutcomeContractOrThrow(state: ModeState): ModeState {
+  const validation = applyRunOutcomeContract(state as Record<string, unknown>);
+  if (!validation.ok || !validation.state) {
+    throw new Error(validation.error || 'Invalid run outcome state');
+  }
+  return validation.state as ModeState;
+}
+
+function normalizeModeStateOrThrow(mode: string, state: ModeState): ModeState {
+  const normalized = mode === 'ralph'
+    ? normalizeRalphModeStateOrThrow(state)
+    : state;
+  return applySharedRunOutcomeContractOrThrow(normalized);
+}
+
 function stateDir(projectRoot?: string): string {
   return getBaseStateDir(projectRoot);
 }
@@ -101,12 +120,14 @@ export async function startMode(
   await mkdir(dir, { recursive: true });
 
   const scope = await resolveStateScope(projectRoot);
+  const baseStateDir = getBaseStateDir(projectRoot);
   let transitionMessage: string | undefined;
   if (isTrackedWorkflowMode(mode)) {
     const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
       action: 'start',
       sessionId: scope.sessionId,
       source: 'startMode',
+      baseStateDir,
     });
     transitionMessage = transition.transitionMessage;
   }
@@ -125,13 +146,13 @@ export async function startMode(
   };
 
   const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
-  const state = mode === 'ralph'
-    ? normalizeRalphModeStateOrThrow(withContext)
-    : withContext;
+  const state = normalizeModeStateOrThrow(mode, withContext);
   await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(state, null, 2));
+  await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
   if (isTrackedWorkflowMode(mode)) {
     await syncCanonicalSkillStateForMode({
       cwd: projectRoot ?? process.cwd(),
+      baseStateDir,
       mode,
       active: true,
       currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
@@ -176,6 +197,37 @@ export async function readModeStateForSession(
   return readModeStateFromPaths(paths);
 }
 
+export async function readModeStateForActiveDecision(
+  mode: string,
+  sessionId: string | undefined,
+  projectRoot?: string,
+): Promise<ModeState | null> {
+  let paths: string[];
+  try {
+    paths = await getAuthoritativeActiveStatePaths(mode, projectRoot, sessionId);
+  } catch {
+    return null;
+  }
+  return readModeStateFromPaths(paths);
+}
+
+function assertRalphUpdateMatchesSession(state: ModeState, sessionId?: string): void {
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!normalizedSessionId) return;
+
+  const ownerOmxSessionId = typeof state.owner_omx_session_id === 'string'
+    ? state.owner_omx_session_id.trim()
+    : '';
+  if (ownerOmxSessionId && ownerOmxSessionId !== normalizedSessionId) {
+    throw new Error(`Mode ralph state belongs to another session (${ownerOmxSessionId})`);
+  }
+
+  const stateSessionId = typeof state.session_id === 'string' ? state.session_id.trim() : '';
+  if (stateSessionId && stateSessionId !== normalizedSessionId) {
+    throw new Error(`Mode ralph state belongs to another session (${stateSessionId})`);
+  }
+}
+
 /**
  * Update mode state (merge fields)
  */
@@ -185,25 +237,35 @@ export async function updateModeState(
   projectRoot?: string,
   explicitSessionId?: string,
 ): Promise<ModeState> {
-  const current = explicitSessionId
-    ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
-    : await readModeState(mode, projectRoot);
-  if (!current) throw new Error(`Mode ${mode} not found`);
   const scope = await resolveStateScope(projectRoot, explicitSessionId);
+  const baseStateDir = getBaseStateDir(projectRoot);
+  const current = mode === 'ralph' && scope.sessionId
+    ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
+    : explicitSessionId
+      ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
+      : await readModeState(mode, projectRoot);
+  if (!current) throw new Error(`Mode ${mode} not found`);
   await mkdir(scope.stateDir, { recursive: true });
 
+  if (mode === 'ralph') {
+    assertRalphUpdateMatchesSession(current, scope.sessionId);
+  }
+
   const updatedBase = { ...current, ...updates };
+  if (!Object.prototype.hasOwnProperty.call(updates, 'run_outcome')) {
+    delete updatedBase.run_outcome;
+  }
   if (mode === 'ralph' && scope.sessionId && typeof updatedBase.owner_omx_session_id !== 'string') {
     updatedBase.owner_omx_session_id = scope.sessionId;
   }
-  const normalizedBase = mode === 'ralph'
-    ? normalizeRalphModeStateOrThrow(updatedBase as ModeState)
-    : updatedBase;
+  const normalizedBase = normalizeModeStateOrThrow(mode, updatedBase as ModeState);
   const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
   await writeFile(getStatePath(mode, projectRoot, scope.sessionId), JSON.stringify(updated, null, 2));
+  await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
   if (isTrackedWorkflowMode(mode)) {
     await syncCanonicalSkillStateForMode({
       cwd: projectRoot ?? process.cwd(),
+      baseStateDir,
       mode,
       active: updated.active === true,
       currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,

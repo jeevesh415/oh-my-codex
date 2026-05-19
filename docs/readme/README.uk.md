@@ -43,7 +43,7 @@ OMX — це шар робочих процесів для [OpenAI Codex CLI](ht
 | HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
 | Junho Yeo | [@junhoyeo](https://github.com/junhoyeo) |
 | JiHongKim98 | [@JiHongKim98](https://github.com/JiHongKim98) |
-| Lor | — |
+| Lor | [@gobylor](https://github.com/gobylor) |
 | HyunjunJeon | [@HyunjunJeon](https://github.com/HyunjunJeon) |
 
 ## Рекомендований стандартний процес
@@ -182,7 +182,7 @@ omx sparkshell --tmux-pane %12 --tail-lines 400
 
 Для не-командних сесій OMX тепер працює переважно через нативні хуки:
 
-- `omx setup` має увімкнути нативні хуки Codex (`[features].codex_hooks = true`) у
+- `omx setup` має увімкнути нативні хуки Codex (`[features].hooks = true`) у
   підтримуваних областях.
 - локальні хуки Codex на рівні репозиторію є канонічною поверхнею автоматизації для не-командних сесій
 - `omx tmux-hook` зарезервовано для поведінки командного рушія та усунення проблем із застарілим tmux

@@ -2,8 +2,10 @@ import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
+import { omxRoot } from '../utils/paths.js';
 import { getPackageRoot } from '../utils/package.js';
 import { resolveCodexPane } from '../scripts/tmux-hook-engine.js';
+import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 
 type TmuxTargetType = 'session' | 'pane';
 
@@ -89,7 +91,7 @@ export async function tmuxHookCommand(args: string[]): Promise<void> {
 }
 
 function omxDir(cwd = process.cwd()): string {
-  return join(cwd, '.omx');
+  return omxRoot(cwd);
 }
 
 function tmuxHookConfigPath(cwd = process.cwd()): string {
@@ -207,7 +209,7 @@ async function loadConfigForCommand(
 }
 
 function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
-  const result = spawnSync('tmux', args, { encoding: 'utf-8',
+  const result = spawnSync(resolveTmuxBinaryForPlatform() || 'tmux', args, { encoding: 'utf-8',
       windowsHide: true,
     });
   if (result.error) {

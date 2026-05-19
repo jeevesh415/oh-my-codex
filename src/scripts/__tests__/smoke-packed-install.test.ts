@@ -8,6 +8,7 @@ import {
   ensureRepoDependencies,
   hasUsableNodeModules,
   PACKED_INSTALL_SMOKE_CORE_COMMANDS,
+  parseNpmPackJsonOutput,
   resolveGitCommonDir,
   resolveReusableNodeModulesSource,
 } from '../smoke-packed-install.js';
@@ -16,11 +17,31 @@ test('packed install smoke stays limited to boot + core commands', () => {
   assert.deepEqual(PACKED_INSTALL_SMOKE_CORE_COMMANDS, [
     ['--help'],
     ['version'],
+    ['api', '--help'],
+    ['sparkshell', '--help'],
   ]);
   assert.equal(
-    PACKED_INSTALL_SMOKE_CORE_COMMANDS.some((argv) => argv.includes('explore') || argv.includes('sparkshell')),
-    false,
+    PACKED_INSTALL_SMOKE_CORE_COMMANDS.some((argv) => argv.includes('api')),
+    true,
   );
+  assert.equal(
+    PACKED_INSTALL_SMOKE_CORE_COMMANDS.some((argv) => argv.includes('sparkshell')),
+    true,
+  );
+});
+
+test('parseNpmPackJsonOutput ignores prepack logs before npm pack JSON', () => {
+  const parsed = parseNpmPackJsonOutput([
+    '[sync-plugin-mirror] synced 29 canonical skill directories and plugin metadata',
+    '[',
+    '  {',
+    '    "filename": "oh-my-codex-0.15.0.tgz"',
+    '  }',
+    ']',
+    '',
+  ].join('\n'));
+
+  assert.deepEqual(parsed, [{ filename: 'oh-my-codex-0.15.0.tgz' }]);
 });
 
 test('resolveGitCommonDir resolves relative git common dir output against the repo root', () => {

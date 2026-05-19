@@ -1,6 +1,6 @@
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { getReadScopedStatePaths } from '../mcp/state-paths.js';
+import { getAuthoritativeActiveStatePaths } from '../mcp/state-paths.js';
 
 export const TRACKED_WORKFLOW_MODES = [
   'autopilot',
@@ -23,19 +23,22 @@ const ALLOWED_OVERLAP_PAIRS = new Set([
 
 const AUTO_COMPLETE_TRANSITIONS = new Set([
   'deep-interview->ralplan',
+  'deep-interview->autoresearch',
   'ralplan->team',
   'ralplan->ralph',
   'ralplan->autopilot',
+  'ralplan->autoresearch',
+  'autopilot->ralplan',
 ]);
 
 const PLANNING_LIKE_MODES = new Set<TrackedWorkflowMode>([
   'deep-interview',
   'ralplan',
-  'autoresearch',
 ]);
 
 const EXECUTION_LIKE_MODES = new Set<TrackedWorkflowMode>([
   'autopilot',
+  'autoresearch',
   'team',
   'ralph',
   'ultrawork',
@@ -188,14 +191,14 @@ export function buildWorkflowTransitionError(
       `Cannot ${action} ${requestedMode}: ${activeModesMessage}.`,
       'Execution-to-planning rollback auto-complete is not allowed.',
       'First clear current state first and retry if this action is intended.',
-      `Clear incompatible workflow state via \`omx state clear --mode <mode>\` or the \`omx_state.*\` MCP tools, then retry.`,
+      `Clear incompatible workflow state yourself via \`omx state clear --input '{"mode":"<mode>"}' --json\`; if explicit MCP compatibility is enabled, \`omx_state.*\` tools are also acceptable.`,
     ].join(' ');
   }
   return [
     `Cannot ${action} ${requestedMode}: ${activeModesMessage}.`,
     `Unsupported workflow overlap: ${overlap}.`,
     'Current state is unchanged.',
-    `Clear incompatible workflow state via \`omx state clear --mode <mode>\` or the \`omx_state.*\` MCP tools, then retry.`,
+    `Clear incompatible workflow state yourself via \`omx state clear --input '{"mode":"<mode>"}' --json\`; if explicit MCP compatibility is enabled, \`omx_state.*\` tools are also acceptable.`,
   ].join(' ');
 }
 
@@ -216,7 +219,7 @@ export async function readActiveWorkflowModes(
   const activeModes: TrackedWorkflowMode[] = [];
 
   for (const mode of TRACKED_WORKFLOW_MODES) {
-    const candidatePaths = await getReadScopedStatePaths(mode, cwd, sessionId);
+    const candidatePaths = await getAuthoritativeActiveStatePaths(mode, cwd, sessionId);
     for (const candidatePath of candidatePaths) {
       if (!existsSync(candidatePath)) continue;
       try {
@@ -227,7 +230,7 @@ export async function readActiveWorkflowModes(
         break;
       } catch {
         throw new Error(
-          `Cannot read ${mode} workflow state at ${candidatePath}. Clear or repair state via \`omx state clear --mode ${mode}\` or the \`omx_state.*\` MCP tools.`,
+          `Cannot read ${mode} workflow state at ${candidatePath}. Repair or clear that workflow state yourself via \`omx state clear --input '{"mode":"${mode}"}' --json\`; if explicit MCP compatibility is enabled, \`omx_state.*\` tools are also acceptable.`,
         );
       }
     }
